@@ -21,7 +21,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install firebase-admin google-genai
+          pip install firebase-admin google-genai markdown
 
       - name: Run AI Manager
         env:
