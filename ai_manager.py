@@ -7,6 +7,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
+import markdown # הספרייה החדשה שממירה את הטקסט לעיצוב נקי!
 
 # קריאת סודות מהסביבה (Environment Variables)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -14,7 +15,6 @@ DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL")
 SENDER_EMAIL = os.getenv("GMAIL_USER")
 SENDER_PASSWORD = os.getenv("GMAIL_PASS")
 
-# טיפול מיוחד במפתח ה-Firebase (קריאה מתוך מחרוזת טקסט)
 service_account_info = json.loads(os.getenv("FIREBASE_SERVICE_ACCOUNT"))
 
 print("Connecting to Firebase and Gemini...")
@@ -24,11 +24,8 @@ if not firebase_admin._apps:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-
 def process_all_controllers():
     print("Fetching all controllers from Firebase...")
-
-    # הפעם אנחנו מושכים את כל תיקיית ה-controllers دفעה אחת!
     controllers_ref = db.reference('controllers')
     all_controllers = controllers_ref.get()
 
@@ -36,13 +33,10 @@ def process_all_controllers():
         print("No controllers found in database.")
         return
 
-    # לולאה שעוברת בקר-בקר
     for controller_id, data in all_controllers.items():
         print(f"\n[{controller_id}] -----------------------------------")
-
         settings = data.get('settings', {})
 
-        # בודק אם הלקוח בכלל רוצה דוח
         if not settings.get('ai_optin', False):
             print(f"[{controller_id}] Skipped: AI reports disabled.")
             continue
@@ -83,7 +77,7 @@ def process_all_controllers():
 
         יעדי הגידול:
         - טמפרטורה: {settings.get('temp_min')} - {settings.get('temp_max')} °C
-        - pH: {settings.get('ph_min')} - {settings.get('ph_max')} 
+        - pH: {settings.get('ph_min')} - {settings.get('ph_max')}
         - EC: {settings.get('ec_min')} - {settings.get('ec_max')} uS
 
         היסטוריה (כל 10 דק'):
@@ -97,18 +91,91 @@ def process_all_controllers():
                 model='gemini-2.5-flash',
                 contents=prompt,
             )
-            print(f"[{controller_id}] Report generated! Sending email to {client_email}...")
+            print(f"[{controller_id}] Report generated! Formatting HTML and sending email to {client_email}...")
 
-            # --- קוד שליחת האימייל ---
-            msg = MIMEMultipart()
+            # --- 1. המרת הטקסט של ג'מיני לעיצוב HTML תקין ---
+            html_body = markdown.markdown(response.text)
+
+            # --- 2. תבנית העיצוב המדהימה של המייל ---
+            html_template = f"""
+            <!DOCTYPE html>
+            <html lang="he" dir="rtl">
+            <head>
+                <meta charset="UTF-8">
+                <style>
+                    body {{
+                        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                        background-color: #f4f7f6;
+                        color: #333333;
+                        margin: 0;
+                        padding: 20px;
+                    }}
+                    .container {{
+                        max-width: 600px;
+                        margin: 0 auto;
+                        background-color: #ffffff;
+                        border-radius: 10px;
+                        overflow: hidden;
+                        box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+                    }}
+                    .header {{
+                        background-color: #8b5cf6; /* צבע סגול שמתאים לדשבורד שלך */
+                        color: #ffffff;
+                        padding: 20px;
+                        text-align: center;
+                    }}
+                    .header h1 {{
+                        margin: 0;
+                        font-size: 24px;
+                    }}
+                    .content {{
+                        padding: 30px;
+                        line-height: 1.6;
+                        font-size: 16px;
+                    }}
+                    .content h2, .content h3 {{
+                        color: #8b5cf6;
+                    }}
+                    .content strong {{
+                        color: #1e293b;
+                    }}
+                    .footer {{
+                        background-color: #f8fafc;
+                        text-align: center;
+                        padding: 15px;
+                        font-size: 12px;
+                        color: #64748b;
+                        border-top: 1px solid #e2e8f0;
+                    }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <div class="header">
+                        <h1>דוח אגרונומי חכם 🌿</h1>
+                        <p style="margin: 5px 0 0 0; font-size: 14px;">מערכת ניהול הידרופוניקה | בקר {controller_id}</p>
+                    </div>
+                    <div class="content">
+                        {html_body}
+                    </div>
+                    <div class="footer">
+                        דוח זה הופק אוטומטית על ידי בינה מלאכותית ונשלח ממערכת הבקרה שלכם.<br>
+                        &copy; 2026 כל הזכויות שמורות לשמעון ישעיהו (Shimon Yeshayahu)
+                    </div>
+                </div>
+            </body>
+            </html>
+            """
+
+            # --- 3. בניית האימייל ושליחתו ---
+            msg = MIMEMultipart('alternative')
             msg['From'] = SENDER_EMAIL
             msg['To'] = client_email
             msg['Subject'] = f"דוח אגרונומי חכם - מערכת {controller_id}"
 
-            # הכנסת הטקסט מה-AI לתוך גוף המייל (מוגדר כ-UTF-8 כדי שהעברית תעבוד מושלם)
-            msg.attach(MIMEText(response.text, 'plain', 'utf-8'))
+            # אנחנו מצרפים את ה-HTML שעיצבנו
+            msg.attach(MIMEText(html_template, 'html', 'utf-8'))
 
-            # התחברות לשרתי Gmail ושליחה
             server = smtplib.SMTP('smtp.gmail.com', 587)
             server.starttls()
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
@@ -120,8 +187,5 @@ def process_all_controllers():
         except Exception as e:
             print(f"[{controller_id}] Failed to generate or send report: {e}")
 
-
 if __name__ == "__main__":
     process_all_controllers()
-
-
