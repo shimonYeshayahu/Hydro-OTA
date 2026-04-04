@@ -152,6 +152,8 @@ def process_all_controllers():
             <body>
                 <div class="container">
                     <div class="header">
+                        <img src="URL_HERE" alt="https://raw.githubusercontent.com/shimonYeshayahu/Hydro-OTA/76c988554de2585c9236f2450fb0aa55985b0a1d/logo_shimon.png" style="max-height: 70px; margin-bottom: 15px;">
+                        
                         <h1>דוח אגרונומי חכם 🌿</h1>
                         <p style="margin: 5px 0 0 0; font-size: 14px;">מערכת ניהול הידרופוניקה | בקר {controller_id}</p>
                     </div>
