@@ -1,0 +1,33 @@
+name: Send Daily Hydro Reports
+
+on:
+  schedule:
+    # הגדרת זמן: כל יום ב-06:00 UTC (שזה 08:00 או 09:00 בישראל)
+    - cron: '0 6 * * *'
+  workflow_dispatch: # מאפשר להריץ את זה גם ידנית בלחיצת כפתור
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install firebase-admin google-genai
+
+      - name: Run AI Manager
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_PASS: ${{ secrets.GMAIL_PASS }}
+        run: python ai_manager.py
