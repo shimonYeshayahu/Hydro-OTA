@@ -33,8 +33,31 @@ def process_all_controllers():
         print("No controllers found in database.")
         return
 
+    # חישוב חותמת זמן של "לפני 30 יום" למטרת ניקוי
+    now_ts = datetime.now().timestamp()
+    retention_days = 30
+    expiration_threshold = now_ts - (retention_days * 24 * 60 * 60)
+
     for controller_id, data in all_controllers.items():
         print(f"\n[{controller_id}] -----------------------------------")
+
+        # --- 1. מנגנון ניקוי היסטוריה (רץ תמיד, עבור כל בקר!) ---
+        history_data = data.get('history', {})
+        if history_data:
+            print(f"[{controller_id}] Checking for old history records to clean...")
+            deleted_count = 0
+
+            for key, entry in history_data.items():
+                if entry.get('timestamp', 0) < expiration_threshold:
+                    db.reference(f'controllers/{controller_id}/history/{key}').delete()
+                    deleted_count += 1
+
+            if deleted_count > 0:
+                print(f"[{controller_id}] Cleaned up {deleted_count} old records.")
+            else:
+                print(f"[{controller_id}] No old records to clean.")
+
+        # --- 2. מנגנון דוחות AI ---
         settings = data.get('settings', {})
 
         if not settings.get('ai_optin', False):
@@ -51,7 +74,6 @@ def process_all_controllers():
         telemetry = data.get('telemetry', {})
         targets = data.get('targets', {})
         faults = data.get('faults', {})
-        history_data = data.get('history', {})
         style = settings.get('ai_style', 'professional')
 
         history_text = ""
@@ -72,19 +94,19 @@ def process_all_controllers():
             history_text = "אין עדיין נתונים היסטוריים מספיקים."
 
         prompt = f"""
-        אתה אגרונום מומחה לגידול הידרופוני. תפקידך לנתח את נתוני המערכת של בקר {controller_id}.
-        סגנון הכתיבה הנדרש: {'דוח מקצועי, רשמי ומדויק' if style == 'professional' else 'קליל, ידידותי, מעודד ובגובה העיניים'}.
+            אתה אגרונום מומחה לגידול הידרופוני. תפקידך לנתח את נתוני המערכת של בקר {controller_id}.
+            סגנון הכתיבה הנדרש: {'דוח מקצועי, רשמי ומדויק' if style == 'professional' else 'קליל, ידידותי, מעודד ובגובה העיניים'}.
 
-        יעדי הגידול:
-        - טמפרטורה: {settings.get('temp_min')} - {settings.get('temp_max')} °C
-        - pH: {settings.get('ph_min')} - {settings.get('ph_max')}
-        - EC: {settings.get('ec_min')} - {settings.get('ec_max')} uS
+            יעדי הגידול:
+            - טמפרטורה: {settings.get('temp_min')} - {settings.get('temp_max')} °C
+            - pH: {settings.get('ph_min')} - {settings.get('ph_max')}
+            - EC: {settings.get('ec_min')} - {settings.get('ec_max')} uS
 
-        היסטוריה (כל 10 דק'):
-        {history_text}
+            היסטוריה (כל 10 דק'):
+            {history_text}
 
-        אנא כתוב דוח קצר (עד 3 פסקאות) הכולל סיכום, מגמות, תקלות (אם יש המילה "תקלה") והמלצות. עברית בלבד.
-        """
+            אנא כתוב דוח קצר (עד 3 פסקאות) הכולל סיכום, מגמות, תקלות (אם יש המילה "תקלה") והמלצות. עברית בלבד.
+            """
 
         try:
             response = client.models.generate_content(
@@ -93,89 +115,48 @@ def process_all_controllers():
             )
             print(f"[{controller_id}] Report generated! Formatting HTML and sending email to {client_email}...")
 
-            # --- 1. המרת הטקסט של ג'מיני לעיצוב HTML תקין ---
             html_body = markdown.markdown(response.text)
 
-            # --- 2. תבנית העיצוב המדהימה של המייל ---
             html_template = f"""
-            <!DOCTYPE html>
-            <html lang="he" dir="rtl">
-            <head>
-                <meta charset="UTF-8">
-                <style>
-                    body {{
-                        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                        background-color: #f4f7f6;
-                        color: #333333;
-                        margin: 0;
-                        padding: 20px;
-                    }}
-                    .container {{
-                        max-width: 600px;
-                        margin: 0 auto;
-                        background-color: #ffffff;
-                        border-radius: 10px;
-                        overflow: hidden;
-                        box-shadow: 0 4px 15px rgba(0,0,0,0.1);
-                    }}
-                    .header {{
-                        background-color: #8b5cf6; /* צבע סגול שמתאים לדשבורד שלך */
-                        color: #ffffff;
-                        padding: 20px;
-                        text-align: center;
-                    }}
-                    .header h1 {{
-                        margin: 0;
-                        font-size: 24px;
-                    }}
-                    .content {{
-                        padding: 30px;
-                        line-height: 1.6;
-                        font-size: 16px;
-                    }}
-                    .content h2, .content h3 {{
-                        color: #8b5cf6;
-                    }}
-                    .content strong {{
-                        color: #1e293b;
-                    }}
-                    .footer {{
-                        background-color: #f8fafc;
-                        text-align: center;
-                        padding: 15px;
-                        font-size: 12px;
-                        color: #64748b;
-                        border-top: 1px solid #e2e8f0;
-                    }}
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <div class="header">
-                        <img src="https://raw.githubusercontent.com/shimonYeshayahu/Hydro-OTA/76c988554de2585c9236f2450fb0aa55985b0a1d/logo_shimon.png" alt="לוגו המערכת" style="max-height: 70px; margin-bottom: 15px;">
-                        
-                        <h1>דוח אגרונומי חכם 🌿</h1>
-                        <p style="margin: 5px 0 0 0; font-size: 14px;">מערכת ניהול הידרופוניקה | בקר {controller_id}</p>
+                <!DOCTYPE html>
+                <html lang="he" dir="rtl">
+                <head>
+                    <meta charset="UTF-8">
+                    <style>
+                        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f7f6; color: #333333; margin: 0; padding: 20px; }}
+                        .container {{ max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }}
+                        .header {{ background-color: #8b5cf6; color: #ffffff; padding: 20px; text-align: center; }}
+                        .header h1 {{ margin: 0; font-size: 24px; }}
+                        .content {{ padding: 30px; line-height: 1.6; font-size: 16px; }}
+                        .content h2, .content h3 {{ color: #8b5cf6; }}
+                        .content strong {{ color: #1e293b; }}
+                        .footer {{ background-color: #f8fafc; text-align: center; padding: 15px; font-size: 12px; color: #64748b; border-top: 1px solid #e2e8f0; }}
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <div class="header">
+                            <img src="https://raw.githubusercontent.com/shimonYeshayahu/Hydro-OTA/76c988554de2585c9236f2450fb0aa55985b0a1d/logo_shimon.png" alt="לוגו המערכת" style="max-height: 70px; margin-bottom: 15px;">
+                            <h1>דוח אגרונומי חכם 🌿</h1>
+                            <p style="margin: 5px 0 0 0; font-size: 14px;">מערכת ניהול הידרופוניקה | בקר {controller_id}</p>
+                        </div>
+                        <div class="content">
+                            {html_body}
+                        </div>
+                        <div class="footer">
+                            דוח זה הופק אוטומטית על ידי בינה מלאכותית ונשלח ממערכת הבקרה שלכם.<br>
+                            &copy; 2026 כל הזכויות שמורות לשמעון ישעיהו (Shimon Yeshayahu)
+                        </div>
                     </div>
-                    <div class="content">
-                        {html_body}
-                    </div>
-                    <div class="footer">
-                        דוח זה הופק אוטומטית על ידי בינה מלאכותית ונשלח ממערכת הבקרה שלכם.<br>
-                        &copy; 2026 כל הזכויות שמורות לשמעון ישעיהו (Shimon Yeshayahu)
-                    </div>
-                </div>
-            </body>
-            </html>
-            """
+                </body>
+                </html>
+                """
 
-            # --- 3. בניית האימייל ושליחתו ---
             msg = MIMEMultipart('alternative')
             msg['From'] = SENDER_EMAIL
             msg['To'] = client_email
             msg['Subject'] = f"דוח אגרונומי חכם - מערכת {controller_id}"
 
-            # אנחנו מצרפים את ה-HTML שעיצבנו
             msg.attach(MIMEText(html_template, 'html', 'utf-8'))
 
             server = smtplib.SMTP('smtp.gmail.com', 587)
@@ -189,5 +170,6 @@ def process_all_controllers():
         except Exception as e:
             print(f"[{controller_id}] Failed to generate or send report: {e}")
 
+        print(f"[{controller_id}] Finished processing.")
 if __name__ == "__main__":
     process_all_controllers()
