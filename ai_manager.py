@@ -7,9 +7,9 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
-import markdown # הספרייה החדשה שממירה את הטקסט לעיצוב נקי!
+import markdown
 
-# קריאת סודות מהסביבה (Environment Variables)
+# משתני סביבה (Environment Variables)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL")
 SENDER_EMAIL = os.getenv("GMAIL_USER")
@@ -33,31 +33,32 @@ def process_all_controllers():
         print("No controllers found in database.")
         return
 
-    # חישוב חותמת זמן של "לפני 30 יום" למטרת ניקוי
+    # מחיקת נתונים ישנים (מעל 7 ימים) כדי לא להעמיס על מסד הנתונים
     now_ts = datetime.now().timestamp()
-    retention_days = 30
+    retention_days = 7
     expiration_threshold = now_ts - (retention_days * 24 * 60 * 60)
 
     for controller_id, data in all_controllers.items():
         print(f"\n[{controller_id}] -----------------------------------")
 
-        # --- 1. מנגנון ניקוי היסטוריה (רץ תמיד, עבור כל בקר!) ---
-        history_data = data.get('history', {})
+        # --- 1. שליפת היסטוריית החיישנים (מהתיקייה החדשה!) ---
+        history_data = data.get('telemetry_history', {})
         if history_data:
             print(f"[{controller_id}] Checking for old history records to clean...")
             deleted_count = 0
 
             for key, entry in history_data.items():
-                if entry.get('timestamp', 0) < expiration_threshold:
-                    db.reference(f'controllers/{controller_id}/history/{key}').delete()
+                # שימוש ב-'time' בדיוק כמו שהבקר שולח
+                if entry.get('time', 0) < expiration_threshold:
+                    db.reference(f'controllers/{controller_id}/telemetry_history/{key}').delete()
                     deleted_count += 1
 
             if deleted_count > 0:
-                print(f"[{controller_id}] Cleaned up {deleted_count} old records.")
+                print(f"[{controller_id}] Cleaned up {deleted_count} old records (older than 7 days).")
             else:
                 print(f"[{controller_id}] No old records to clean.")
 
-        # --- 2. מנגנון דוחות AI ---
+        # --- 2. הפקת דוח AI ---
         settings = data.get('settings', {})
 
         if not settings.get('ai_optin', False):
@@ -71,41 +72,40 @@ def process_all_controllers():
 
         print(f"[{controller_id}] Generating report for {client_email}...")
 
-        telemetry = data.get('telemetry', {})
-        targets = data.get('targets', {})
-        faults = data.get('faults', {})
         style = settings.get('ai_style', 'professional')
 
         history_text = ""
         if history_data:
-            sorted_history = sorted(history_data.values(), key=lambda x: x.get('timestamp', 0))
-            recent_history = sorted_history[-144:]
+            # מיון לפי שדה 'time'
+            sorted_history = sorted(history_data.values(), key=lambda x: x.get('time', 0))
+            # לוקחים את 336 הרשומות האחרונות (שבוע שלם של דגימות כל חצי שעה)
+            recent_history = sorted_history[-336:] 
             for item in recent_history:
-                dt_object = datetime.fromtimestamp(item.get('timestamp', 0))
-                time_str = dt_object.strftime('%H:%M')
-                temp = item.get('temperature', 0)
+                dt_object = datetime.fromtimestamp(item.get('time', 0))
+                time_str = dt_object.strftime('%d/%m %H:%M')
+                temp = item.get('temp', 0)
                 ph = item.get('pH', 0)
                 ec = item.get('EC', 0)
-                if item.get('faults', {}).get('temp'): temp = "תקלה"
-                if item.get('faults', {}).get('ph'): ph = "תקלה"
-                if item.get('faults', {}).get('ec'): ec = "תקלה"
-                history_text += f"[{time_str}] Temp: {temp}, pH: {ph}, EC: {ec}\n"
+                history_text += f"[{time_str}] Temp: {temp:.1f}, pH: {ph:.2f}, EC: {ec:.0f}\n"
         else:
-            history_text = "אין עדיין נתונים היסטוריים מספיקים."
+            history_text = "אין עדיין מספיק נתונים היסטוריים השבוע. המערכת החלה באיסוף נתונים."
 
         prompt = f"""
-            אתה אגרונום מומחה לגידול הידרופוני. תפקידך לנתח את נתוני המערכת של בקר {controller_id}.
-            סגנון הכתיבה הנדרש: {'דוח מקצועי, רשמי ומדויק' if style == 'professional' else 'קליל, ידידותי, מעודד ובגובה העיניים'}.
+            אתה אגרונום מומחה למערכות הידרופוניקה. עליך להפיק דוח סטטוס שבועי עבור בקר {controller_id}.
+            סגנון הכתיבה המבוקש: {'מקצועי, מדעי ואנליטי' if style == 'professional' else 'קליל, ידידותי, ובגובה העיניים למגדל הביתי'}.
 
-            יעדי הגידול:
+            יעדי הגידול (מוגדרים במערכת):
             - טמפרטורה: {settings.get('temp_min')} - {settings.get('temp_max')} °C
-            - pH: {settings.get('ph_min')} - {settings.get('ph_max')}
-            - EC: {settings.get('ec_min')} - {settings.get('ec_max')} uS
+            - חומציות (pH): {settings.get('ph_min')} - {settings.get('ph_max')}
+            - מוליכות (EC): {settings.get('ec_min')} - {settings.get('ec_max')} uS
 
-            היסטוריה (כל 10 דק'):
+            היסטוריית מדדים (דגימה כל חצי שעה מהשבוע האחרון):
             {history_text}
 
-            אנא כתוב דוח קצר (עד 3 פסקאות) הכולל סיכום, מגמות, תקלות (אם יש המילה "תקלה") והמלצות. עברית בלבד.
+            נתח את הנתונים מהשבוע האחרון. 
+            1. האם המדדים יציבים ובטווח? 
+            2. האם יש חריגות או מגמות שמצריכות התערבות? 
+            3. סכם במספר המלצות פרקטיות להמשך הגידול.
             """
 
         try:
@@ -137,14 +137,14 @@ def process_all_controllers():
                     <div class="container">
                         <div class="header">
                             <img src="https://raw.githubusercontent.com/shimonYeshayahu/Hydro-OTA/76c988554de2585c9236f2450fb0aa55985b0a1d/logo_shimon.png" alt="לוגו המערכת" style="max-height: 70px; margin-bottom: 15px;">
-                            <h1>דוח אגרונומי חכם 🌿</h1>
-                            <p style="margin: 5px 0 0 0; font-size: 14px;">מערכת ניהול הידרופוניקה | בקר {controller_id}</p>
+                            <h1>דוח אגרונומי חכם</h1>
+                            <p style="margin: 5px 0 0 0; font-size: 14px;">מערכת בקרה הידרופונית | בקר {controller_id}</p>
                         </div>
                         <div class="content">
                             {html_body}
                         </div>
                         <div class="footer">
-                            דוח זה הופק אוטומטית על ידי בינה מלאכותית ונשלח ממערכת הבקרה שלכם.<br>
+                            דוח זה הופק אוטומטית על ידי מנוע הבינה המלאכותית של מערכת סמארט הידרו.<br>
                             &copy; 2026 כל הזכויות שמורות לשמעון ישעיהו (Shimon Yeshayahu)
                         </div>
                     </div>
@@ -155,7 +155,7 @@ def process_all_controllers():
             msg = MIMEMultipart('alternative')
             msg['From'] = SENDER_EMAIL
             msg['To'] = client_email
-            msg['Subject'] = f"דוח אגרונומי חכם - מערכת {controller_id}"
+            msg['Subject'] = f"דוח אגרונומי חכם - בקר {controller_id}"
 
             msg.attach(MIMEText(html_template, 'html', 'utf-8'))
 
@@ -171,5 +171,6 @@ def process_all_controllers():
             print(f"[{controller_id}] Failed to generate or send report: {e}")
 
         print(f"[{controller_id}] Finished processing.")
+
 if __name__ == "__main__":
     process_all_controllers()
