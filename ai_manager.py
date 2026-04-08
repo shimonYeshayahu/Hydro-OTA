@@ -69,6 +69,14 @@ def process_all_controllers():
         if not client_email:
             print(f"[{controller_id}] Error: AI enabled, but no email address provided!")
             continue
+        latest_timestamp = 0
+        if history_data:
+            latest_timestamp = max(entry.get('time', 0) for entry in history_data.values())
+
+            
+        if now_ts - latest_timestamp > (24 * 60 * 60):
+            print(f"[{controller_id}] Skipped: Controller is offline (No data received in the last 24 hours).")
+            continue
 
         print(f"[{controller_id}] Generating report for {client_email}...")
 
