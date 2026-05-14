@@ -1,0 +1,30 @@
+name: SmartHydro Alert Monitor
+
+on:
+  schedule:
+    # רץ כל 5 דקות. cron של GitHub Actions לפעמים מתעכב כמה דקות בעומס.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:  # ידני לבדיקות
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install firebase-admin
+
+      - name: Run alert monitor
+        env:
+          FIREBASE_DATABASE_URL: ${{ secrets.FIREBASE_DATABASE_URL }}
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: python alert_monitor.py
