@@ -1,20 +1,33 @@
+"""
+SmartHydro AI Manager – Daily Gemini Report Generator
+=====================================================
+רץ פעם ביום ב-GitHub Actions cron (06:00 UTC).
+1. עובר על כל הבקרים ב-Firebase RTDB.
+2. מסנן רק PRO / PRO+ (תרים אחרים מדולגים).
+3. בודק שהבקר חי (realtime/lastUpdate < 24h).
+4. אוסף נתוני daily/ לכל הימים מתחילת המחזור הנוכחי.
+5. קורא ל-Gemini API → דוח השוואתי בעברית.
+6. כותב את הדוח חזרה ל-RTDB ב-controllers/{MAC}/daily/{today}/gemini_report.
+7. שולח email ל-owner.
+"""
+
 import os
 import json
-import firebase_admin
-from firebase_admin import credentials, db
-from google import genai
+from datetime import datetime, timedelta
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime
+
+import firebase_admin
+from firebase_admin import credentials, db
+from google import genai
 import markdown
 
-# משתני סביבה (Environment Variables)
+# --- משתני סביבה (GitHub Actions secrets) ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL")
 SENDER_EMAIL = os.getenv("GMAIL_USER")
 SENDER_PASSWORD = os.getenv("GMAIL_PASS")
-
 service_account_info = json.loads(os.getenv("FIREBASE_SERVICE_ACCOUNT"))
 
 print("Connecting to Firebase and Gemini...")
@@ -24,130 +37,215 @@ if not firebase_admin._apps:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+REPORT_TIERS = ('pro', 'pro_plus')
+
+
+def parse_cycle_start(cycle_start_str):
+    """ממיר 'DD/MM/YYYY' ל-datetime, או None."""
+    if not cycle_start_str or cycle_start_str == "Not Set":
+        return None
+    try:
+        return datetime.strptime(cycle_start_str, '%d/%m/%Y')
+    except (ValueError, TypeError):
+        return None
+
+
+def collect_daily_history(daily_node, cycle_start_dt):
+    """
+    מחזיר רשימה של רשומות daily מתחילת המחזור הנוכחי, ממוינות לפי תאריך.
+    daily_node: dict של controllers/{MAC}/daily/{YYYY-MM-DD}: {...}
+    """
+    if not isinstance(daily_node, dict):
+        return []
+    entries = []
+    cutoff = cycle_start_dt.date() if cycle_start_dt else None
+    for date_key, day_data in daily_node.items():
+        if not isinstance(day_data, dict):
+            continue
+        try:
+            d = datetime.strptime(date_key, '%Y-%m-%d').date()
+        except ValueError:
+            continue
+        if cutoff and d < cutoff:
+            continue
+        if 'gemini_report' in day_data:
+            day_data = {k: v for k, v in day_data.items() if k != 'gemini_report'}
+        entries.append((d, day_data))
+    entries.sort(key=lambda e: e[0])
+    return entries
+
+
+def format_history_for_prompt(entries):
+    if not entries:
+        return "(אין עדיין נתונים יומיים מאז תחילת המחזור)"
+    lines = []
+    for d, data in entries:
+        ph = data.get('ph_avg', 0)
+        ec = data.get('ec_avg', 0)
+        t = data.get('temp_avg', 0)
+        ph_min = data.get('ph_min', 0); ph_max = data.get('ph_max', 0)
+        ec_min = data.get('ec_min', 0); ec_max = data.get('ec_max', 0)
+        lines.append(
+            f"[{d.strftime('%d/%m')}] pH={ph:.2f} (min {ph_min:.2f}, max {ph_max:.2f}), "
+            f"EC={ec:.0f} (min {ec_min:.0f}, max {ec_max:.0f}), Temp={t:.1f}°C"
+        )
+    return "\n".join(lines)
+
+
+def generate_report(controller_id, settings, history_entries, cycle_start_dt, cycle_count):
+    style_pref = settings.get('ai_style', 'professional') if isinstance(settings, dict) else 'professional'
+    style_text = ('מקצועי, מדעי ואנליטי' if style_pref == 'professional'
+                  else 'קליל, ידידותי, ובגובה העיניים למגדל הביתי')
+
+    targets = {
+        'temp_min': settings.get('temp_min', '?'), 'temp_max': settings.get('temp_max', '?'),
+        'ph_min': settings.get('ph_min', '?'), 'ph_max': settings.get('ph_max', '?'),
+        'ec_min': settings.get('ec_min', '?'), 'ec_max': settings.get('ec_max', '?'),
+    } if isinstance(settings, dict) else {}
+
+    cycle_str = cycle_start_dt.strftime('%d/%m/%Y') if cycle_start_dt else "לא הוגדר"
+    days_into_cycle = (datetime.now().date() - cycle_start_dt.date()).days if cycle_start_dt else "?"
+
+    today_summary = ""
+    if history_entries:
+        d, data = history_entries[-1]
+        today_summary = (f"היום ({d.strftime('%d/%m')}): pH={data.get('ph_avg', 0):.2f}, "
+                         f"EC={data.get('ec_avg', 0):.0f}, Temp={data.get('temp_avg', 0):.1f}°C")
+
+    prompt = f"""אתה אגרונום מומחה למערכות הידרופוניקה. הפק דוח יומי השוואתי עבור בקר {controller_id}.
+סגנון: {style_text}.
+
+מחזור גידול נוכחי #{cycle_count}, החל ב-{cycle_str} (יום {days_into_cycle} למחזור).
+
+יעדי הגידול:
+- טמפרטורה: {targets.get('temp_min')}–{targets.get('temp_max')} °C
+- pH: {targets.get('ph_min')}–{targets.get('ph_max')}
+- EC: {targets.get('ec_min')}–{targets.get('ec_max')} µS
+
+{today_summary}
+
+היסטוריה יומית מאז תחילת המחזור:
+{format_history_for_prompt(history_entries)}
+
+הנחיות לדוח:
+1. סיכום היום (איך עבר היום ביחס ליעדים).
+2. השוואה למחזור עד כה: מגמות, יציבות, חריגות.
+3. ציון נקודות מפנה אם קיימות (יום שבו משהו השתנה משמעותית).
+4. המלצות פרקטיות להמשך המחזור.
+
+החזר אך ורק את תוכן הדוח בפורמט Markdown בעברית."""
+
+    response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+    return response.text
+
+
+def send_report_email(client_email, controller_id, report_md, cycle_count, days_into_cycle):
+    html_body = markdown.markdown(report_md)
+    html_template = f"""
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head><meta charset="UTF-8"></head>
+<body style="font-family: sans-serif; direction: rtl; text-align: right; padding: 20px;">
+    <div style="max-width: 600px; margin: 0 auto; border: 1px solid #ddd; border-radius: 10px; overflow: hidden;">
+        <div style="background: #8b5cf6; color: white; padding: 20px; text-align: center;">
+            <h1>דוח אגרונומי יומי</h1>
+            <p>בקר: {controller_id} | מחזור #{cycle_count} | יום {days_into_cycle}</p>
+        </div>
+        <div style="padding: 20px;">{html_body}</div>
+        <div style="background: #f8fafc; padding: 10px; text-align: center; font-size: 12px;">
+            &copy; 2026 SmartHydro Systems
+        </div>
+    </div>
+</body>
+</html>"""
+    msg = MIMEMultipart('alternative')
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = client_email
+    msg['Subject'] = f"דוח אגרונומי יומי - בקר {controller_id}"
+    msg.attach(MIMEText(html_template, 'html', 'utf-8'))
+
+    server = smtplib.SMTP('smtp.gmail.com', 587)
+    server.starttls()
+    server.login(SENDER_EMAIL, SENDER_PASSWORD)
+    server.send_message(msg)
+    server.quit()
+
+
 def process_all_controllers():
     print("Fetching all controllers from Firebase...")
-    controllers_ref = db.reference('controllers')
-    all_controllers = controllers_ref.get()
-
+    all_controllers = db.reference('controllers').get() or {}
     if not all_controllers:
-        print("No controllers found in database.")
+        print("No controllers found.")
         return
 
     now_ts = datetime.now().timestamp()
+    today_str = datetime.now().strftime('%Y-%m-%d')
 
     for controller_id, data in all_controllers.items():
         print(f"\n[{controller_id}] -----------------------------------")
-
-        # --- 1. שליפת היסטוריית החיישנים מ-weekly_logs (גרסה 12.2) ---
-        weekly_logs = data.get('weekly_logs', {})
-        all_history_entries = []
-        
-        if weekly_logs:
-            print(f"[{controller_id}] Consolidating weekly logs...")
-            # איחוד כל הימים (day_0 עד day_6) לרשימה אחת
-            for day_key, day_data in weekly_logs.items():
-                if isinstance(day_data, dict):
-                    all_history_entries.extend(day_data.values())
-            
-            # מיון לפי זמן
-            all_history_entries = sorted(all_history_entries, key=lambda x: x.get('time', 0))
-        
-        # --- 2. בדיקת דופק (Pulse Check) ---
-        latest_timestamp = 0
-        if all_history_entries:
-            latest_timestamp = all_history_entries[-1].get('time', 0)
-
-        # אם הדגימה האחרונה זקנה יותר מ-24 שעות - הבקר לא פעיל
-        if now_ts - latest_timestamp > (24 * 60 * 60):
-            print(f"[{controller_id}] Skipped: Controller is offline (No data in last 24h).")
+        if not isinstance(data, dict):
             continue
 
-        # --- 3. הפקת דוח AI ---
-        settings = data.get('settings', {})
-        if not settings.get('ai_optin', False):
-            print(f"[{controller_id}] Skipped: AI reports disabled.")
+        # 1. סינון לפי tier (subscription/tier; ברירת מחדל = free)
+        sub = data.get('subscription', {}) if isinstance(data.get('subscription'), dict) else {}
+        tier = sub.get('tier', 'free')
+        if tier not in REPORT_TIERS:
+            print(f"[{controller_id}] Skipped: tier={tier}")
+            continue
+        # תוקף פג? עדיין נשלח דוח אם זה הוא יום התפוגה (לקוח אמור לקבל אישור עד הרגע האחרון)
+        expires_at = sub.get('expiresAt', 0)
+        if expires_at and expires_at < now_ts:
+            print(f"[{controller_id}] Skipped: subscription expired")
             continue
 
-        client_email = settings.get('ai_email', '')
-        if not client_email:
-            print(f"[{controller_id}] Error: AI enabled, but no email provided!")
+        # 2. בדיקת דופק (realtime/lastUpdate בתוך 24h אחרונות)
+        realtime = data.get('realtime', {}) if isinstance(data.get('realtime'), dict) else {}
+        last_update = realtime.get('lastUpdate', 0) or 0
+        if now_ts - last_update > 86400:
+            print(f"[{controller_id}] Skipped: offline (last_update={last_update})")
             continue
 
-        print(f"[{controller_id}] Generating report for {client_email}...")
-        style = settings.get('ai_style', 'professional')
+        # 3. owner email
+        owner_email = data.get('owner_email') or ''
+        if not owner_email:
+            print(f"[{controller_id}] Skipped: no owner_email")
+            continue
 
-        history_text = ""
-        if all_history_entries:
-            # לוקחים את 336 הרשומות האחרונות (שבוע שלם של דגימות כל 10-30 דקות)
-            recent_history = all_history_entries[-336:]
-            for item in recent_history:
-                dt_object = datetime.fromtimestamp(item.get('time', 0))
-                time_str = dt_object.strftime('%d/%m %H:%M')
-                temp = item.get('temp', 0)
-                ph = item.get('ph_val', item.get('pH', 0)) # תומך בשמות השדות החדשים והישנים
-                ec = item.get('ec_val', item.get('EC', 0))
-                history_text += f"[{time_str}] Temp: {temp:.1f}, pH: {ph:.2f}, EC: {ec:.0f}\n"
-        else:
-            history_text = "אין עדיין מספיק נתונים היסטוריים ב-weekly_logs."
+        # 4. cycle metadata
+        meta = data.get('meta', {}) if isinstance(data.get('meta'), dict) else {}
+        cycle_start_dt = parse_cycle_start(meta.get('cycleStartDate'))
+        cycle_count = meta.get('cycleCount', 1)
 
-        prompt = f"""
-                    אתה אגרונום מומחה למערכות הידרופוניקה. עליך להפיק דוח סטטוס מקיף עבור בקר {controller_id}.
-                    סגנון הכתיבה המבוקש: {'מקצועי, מדעי ואנליטי' if style == 'professional' else 'קליל, ידידותי, ובגובה העיניים למגדל הביתי'}.
+        # 5. היסטוריה יומית מתחילת המחזור
+        daily_node = data.get('daily', {})
+        history = collect_daily_history(daily_node, cycle_start_dt)
 
-                    יעדי הגידול (מוגדרים במערכת):
-                    - טמפרטורה: {settings.get('temp_min')} - {settings.get('temp_max')} °C
-                    - חומציות (pH): {settings.get('ph_min')} - {settings.get('ph_max')}
-                    - מוליכות (EC): {settings.get('ec_min')} - {settings.get('ec_max')} uS
-
-                    היסטוריית מדדים (מתוך weekly_logs):
-                    {history_text}
-
-                    הנחיות לניתוח:
-                    1. נתח את היציבות של המערכת לאורך השבוע האחרון.
-                    2. ציין חריגות מהיעדים אם היו.
-                    3. ספק המלצות פרקטיות לתחזוקה.
-
-                    החזר אך ורק את תוכן הדוח בפורמט Markdown.
-                    """
-
+        # 6. הפקת דוח
         try:
-            response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
-            html_body = markdown.markdown(response.text)
+            settings = data.get('settings', {}) if isinstance(data.get('settings'), dict) else {}
+            report_md = generate_report(controller_id, settings, history, cycle_start_dt, cycle_count)
+        except Exception as e_gen:
+            print(f"[{controller_id}] Gemini error: {e_gen}")
+            continue
 
-            html_template = f"""
-                <!DOCTYPE html>
-                <html lang="he" dir="rtl">
-                <head><meta charset="UTF-8"></head>
-                <body style="font-family: sans-serif; direction: rtl; text-align: right; padding: 20px;">
-                    <div style="max-width: 600px; margin: 0 auto; border: 1px solid #ddd; border-radius: 10px; overflow: hidden;">
-                        <div style="background: #8b5cf6; color: white; padding: 20px; text-align: center;">
-                            <h1>דוח אגרונומי חכם (v12.2)</h1>
-                            <p>בקר: {controller_id}</p>
-                        </div>
-                        <div style="padding: 20px;">{html_body}</div>
-                        <div style="background: #f8fafc; padding: 10px; text-align: center; font-size: 12px;">
-                            &copy; 2026 SmartHydro System
-                        </div>
-                    </div>
-                </body>
-                </html>
-                """
+        # 7. שמירה ב-RTDB (כדי שהדשבורד יוכל להציג)
+        try:
+            db.reference(f'controllers/{controller_id}/daily/{today_str}/gemini_report').set({
+                'generated_at': int(now_ts),
+                'markdown': report_md,
+                'cycle_count': cycle_count
+            })
+        except Exception as e_save:
+            print(f"[{controller_id}] RTDB save warning: {e_save}")
 
-            msg = MIMEMultipart('alternative')
-            msg['From'] = SENDER_EMAIL
-            msg['To'] = client_email
-            msg['Subject'] = f"דוח אגרונומי חכם - בקר {controller_id}"
-            msg.attach(MIMEText(html_template, 'html', 'utf-8'))
+        # 8. שליחת email
+        try:
+            days_into_cycle = (datetime.now().date() - cycle_start_dt.date()).days if cycle_start_dt else 0
+            send_report_email(owner_email, controller_id, report_md, cycle_count, days_into_cycle)
+            print(f"[{controller_id}] Report sent to {owner_email}")
+        except Exception as e_email:
+            print(f"[{controller_id}] Email error: {e_email}")
 
-            server = smtplib.SMTP('smtp.gmail.com', 587)
-            server.starttls()
-            server.login(SENDER_EMAIL, SENDER_PASSWORD)
-            server.send_message(msg)
-            server.quit()
-            print(f"[{controller_id}] Email sent successfully!")
-
-        except Exception as e:
-            print(f"[{controller_id}] Error: {e}")
 
 if __name__ == "__main__":
     process_all_controllers()
