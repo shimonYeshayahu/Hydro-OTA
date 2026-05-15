@@ -292,18 +292,52 @@ def process_feedback():
         print(f"Processed {new_count} feedback entries.")
 
 
+def enforce_subscription_expiry(mac: str, cdata: dict):
+    """אם המנוי פג תוקף – מוריד את ה-tier ל-free וגורר expiresAt.
+    קריטי לאכיפת מודל החיוב.
+    """
+    sub = (cdata.get("subscription") or {})
+    tier = sub.get("tier", "free")
+    if tier == "free":
+        return False
+    expires_at = sub.get("expiresAt") or sub.get("expires_at") or 0
+    if not expires_at:
+        return False
+    if expires_at >= now_ts():
+        return False  # עוד בתוקף
+    # פג תוקף – הורד ל-free
+    try:
+        db.reference(f"controllers/{mac}/subscription").update({
+            "tier": "free",
+            "expiresAt": None,
+            "downgraded_at": now_ts(),
+            "previous_tier": tier
+        })
+        print(f"  [downgrade] {mac}: {tier} → free (expired {datetime.fromtimestamp(expires_at)})")
+        return True
+    except Exception as e:
+        print(f"  [downgrade-err] {mac}: {e}")
+        return False
+
+
 def main():
     controllers = db.reference("controllers").get() or {}
     total = 0
+    downgraded = 0
     for mac, cdata in controllers.items():
         if not isinstance(cdata, dict):
             continue
         total += 1
         try:
+            # אכיפת תוקף לפני בדיקת התראות (כדי שלא נשלח push למי שכבר Free)
+            if enforce_subscription_expiry(mac, cdata):
+                downgraded += 1
+                # רענון cdata אחרי שינוי
+                cdata = db.reference(f"controllers/{mac}").get() or cdata
             evaluate_controller(mac, cdata)
         except Exception as e:
             print(f"[err] {mac}: {e}")
-    print(f"Processed {total} controllers. Quiet hours: {is_quiet_hours()}")
+    print(f"Processed {total} controllers. Downgraded: {downgraded}. Quiet hours: {is_quiet_hours()}")
     # עיבוד פניות משוב חדשות
     process_feedback()
 
