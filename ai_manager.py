@@ -67,8 +67,7 @@ def build_consumption_chart_url(history_entries):
     ph_data = [int(data.get('ph_sec_total', 0) or 0) for _, data in recent]
     ec_data = [int(data.get('ec_sec_total', 0) or 0) for _, data in recent]
 
-    if all(v == 0 for v in ph_data + ec_data):
-        return None  # אין מה להראות
+    # מציגים גרף גם עם כל הערכים 0, כל עוד יש לפחות יום אחד של נתונים
 
     chart_config = {
         "type": "bar",
@@ -157,10 +156,13 @@ def format_history_for_prompt(entries):
     return "\n".join(lines)
 
 
-def generate_report(controller_id, settings, history_entries, cycle_start_dt, cycle_count):
+def generate_report(controller_id, settings, history_entries, cycle_start_dt, cycle_count, device_name=None):
     style_pref = settings.get('ai_style', 'professional') if isinstance(settings, dict) else 'professional'
     style_text = ('מקצועי, מדעי ואנליטי' if style_pref == 'professional'
                   else 'קליל, ידידותי, ובגובה העיניים למגדל הביתי')
+
+    # שם ידידותי במקום MAC – או כינוי המשתמש או "המערכת שלך"
+    friendly_name = device_name if device_name else "המערכת"
 
     targets = {
         'temp_min': settings.get('temp_min', '?'), 'temp_max': settings.get('temp_max', '?'),
@@ -187,8 +189,7 @@ def generate_report(controller_id, settings, history_entries, cycle_start_dt, cy
     total_ec_sec = sum(int(d.get('ec_sec_total', 0) or 0) for _, d in history_entries)
     consumption_text = f"\nצריכת חומרים מצטברת במחזור: חומצה pH – {total_ph_sec} שניות, דשן EC – {total_ec_sec} שניות.\n"
 
-    prompt = f"""אתה אגרונום מומחה למערכות הידרופוניקה. הפק דוח יומי השוואתי עבור בקר {controller_id}.
-סגנון: {style_text}.
+    prompt = f"""אתה אגרונום מומחה למערכות הידרופוניקה. הפק דוח יומי השוואתי לגינה הבאה:
 
 מחזור גידול נוכחי #{cycle_count}, החל ב-{cycle_str} (יום {days_into_cycle} למחזור).
 {plants_section}
@@ -203,22 +204,26 @@ def generate_report(controller_id, settings, history_entries, cycle_start_dt, cy
 {format_history_for_prompt(history_entries)}
 
 הנחיות לדוח:
-1. **תייחס במפורש לצמחים שהמשתמש מגדל** (אם הוגדרו) – האם היעדים והקריאות מתאימים להם? מה הם דורשים בשלב זה?
-2. סיכום היום (איך עבר היום ביחס ליעדים).
-3. השוואה למחזור עד כה: מגמות, יציבות, חריגות.
-4. ציון נקודות מפנה אם קיימות.
-5. **המלצות פרקטיות ספציפיות לסוג הגידול** (לא המלצות כלליות).
-6. אם הצמחים בשלב פריחה/פרי – שים דגש על EC ושעות תאורה.
-7. אם הצמחים הם עלים – שים דגש על pH ויציבות.
+1. **התחל ישר במהות** – אל תפתח במשפט ברכה כמו "שלום למגדל/ת היקר/ה". פתח בכותרת ## או בהצהרת מצב.
+2. **אל תזכיר את מזהה הבקר (MAC address)** – זה מספר טכני, לא שייך לדוח.
+3. **תייחס במפורש לצמחים שהמשתמש מגדל** (אם הוגדרו) – האם היעדים והקריאות מתאימים להם? מה הם דורשים בשלב זה?
+4. סיכום היום (איך עבר היום ביחס ליעדים).
+5. השוואה למחזור עד כה: מגמות, יציבות, חריגות.
+6. ציון נקודות מפנה אם קיימות.
+7. **המלצות פרקטיות ספציפיות לסוג הגידול** (לא המלצות כלליות).
+8. אם הצמחים בשלב פריחה/פרי – שים דגש על EC ושעות תאורה.
+9. אם הצמחים הם עלים – שים דגש על pH ויציבות.
+10. אם רוב הקריאות 0 או חסרות נתונים – ציין שזה מצב תקין במחזור צעיר (פחות מ-2-3 ימים) ולא תקלה.
 
-החזר אך ורק את תוכן הדוח בפורמט Markdown בעברית. השתמש בכותרות ## ובהדגשות **."""
+החזר אך ורק את תוכן הדוח בפורמט Markdown בעברית. השתמש בכותרות ## ובהדגשות **. בלי משפטי פתיחה מנומסים."""
 
     response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
     return response.text
 
 
-def send_report_email(client_email, controller_id, report_md, cycle_count, days_into_cycle, chart_url=None, plants_text=None):
+def send_report_email(client_email, controller_id, report_md, cycle_count, days_into_cycle, chart_url=None, plants_text=None, device_name=None):
     html_body = markdown.markdown(report_md)
+    friendly_name = device_name if device_name else "SmartHydro"
     plants_html = ""
     if plants_text:
         plants_html = f"""
@@ -234,6 +239,11 @@ def send_report_email(client_email, controller_id, report_md, cycle_count, days_
             <img src="{chart_url}" alt="צריכת חומרים יומית" style="max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 8px;">
             <p style="font-size: 11px; color: #6b7280; margin-top: 8px;">כל עמודה = יום אחד במחזור. שניות הפעלה של משאבת חומצה (כחול) ודשן (ירוק).</p>
         </div>"""
+    else:
+        chart_html = """
+        <div style="padding: 15px; background: #fafafa; border-top: 1px solid #eee; text-align: center; color: #9ca3af; font-size: 12px;">
+            📊 גרף הצריכה יופיע כשיצטברו נתונים יומיים (החל מהיום השני במחזור).
+        </div>"""
     html_template = f"""
 <!DOCTYPE html>
 <html lang="he" dir="rtl">
@@ -241,8 +251,8 @@ def send_report_email(client_email, controller_id, report_md, cycle_count, days_
 <body style="font-family: sans-serif; direction: rtl; text-align: right; padding: 20px;">
     <div style="max-width: 600px; margin: 0 auto; border: 1px solid #ddd; border-radius: 10px; overflow: hidden;">
         <div style="background: #8b5cf6; color: white; padding: 20px; text-align: center;">
-            <h1>דוח אגרונומי יומי</h1>
-            <p>בקר: {controller_id} | מחזור #{cycle_count} | יום {days_into_cycle}</p>
+            <h1 style="margin: 0;">דוח אגרונומי יומי</h1>
+            <p style="margin: 5px 0 0 0;">{friendly_name} | מחזור #{cycle_count} | יום {days_into_cycle}</p>
         </div>
         {plants_html}
         <div style="padding: 20px;">{html_body}</div>
@@ -256,7 +266,7 @@ def send_report_email(client_email, controller_id, report_md, cycle_count, days_
     msg = MIMEMultipart('alternative')
     msg['From'] = SENDER_EMAIL
     msg['To'] = client_email
-    msg['Subject'] = f"דוח אגרונומי יומי - בקר {controller_id}"
+    msg['Subject'] = f"דוח אגרונומי יומי – {friendly_name}"
     msg.attach(MIMEText(html_template, 'html', 'utf-8'))
 
     server = smtplib.SMTP('smtp.gmail.com', 587)
@@ -318,7 +328,8 @@ def process_all_controllers():
         # 6. הפקת דוח
         try:
             settings = data.get('settings', {}) if isinstance(data.get('settings'), dict) else {}
-            report_md = generate_report(controller_id, settings, history, cycle_start_dt, cycle_count)
+            device_name = settings.get('deviceName') or None
+            report_md = generate_report(controller_id, settings, history, cycle_start_dt, cycle_count, device_name=device_name)
         except Exception as e_gen:
             print(f"[{controller_id}] Gemini error: {e_gen}")
             continue
@@ -339,7 +350,7 @@ def process_all_controllers():
             chart_url = build_consumption_chart_url(history)
             plants_text = format_plants_for_prompt(settings.get('plants', []) if isinstance(settings, dict) else [])
             send_report_email(owner_email, controller_id, report_md, cycle_count, days_into_cycle,
-                              chart_url=chart_url, plants_text=plants_text)
+                              chart_url=chart_url, plants_text=plants_text, device_name=device_name)
             print(f"[{controller_id}] Report sent to {owner_email} (chart={'yes' if chart_url else 'no'})")
         except Exception as e_email:
             print(f"[{controller_id}] Email error: {e_email}")
