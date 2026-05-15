@@ -13,6 +13,7 @@ SmartHydro AI Manager – Daily Gemini Report Generator
 
 import os
 import json
+import urllib.parse
 from datetime import datetime, timedelta
 import smtplib
 from email.mime.text import MIMEText
@@ -22,6 +23,70 @@ import firebase_admin
 from firebase_admin import credentials, db
 from google import genai
 import markdown
+
+# ============ Plant data (mirror של plants.js – לתיאור בדוח Gemini) ============
+PLANT_NAMES_HE = {
+    'tomato': 'עגבנייה', 'cucumber': 'מלפפון', 'pepper': 'פלפל', 'lettuce': 'חסה',
+    'basil': 'בזיליקום', 'strawberry': 'תות שדה', 'kale': 'קייל', 'spinach': 'תרד',
+    'mint': 'נענע', 'parsley': 'פטרוזיליה', 'cilantro': 'כוסברה', 'chives': 'עירית',
+    'bok_choy': 'בוק צ\'וי', 'swiss_chard': 'מנגולד', 'arugula': 'אורוגולה',
+    'celery': 'סלרי', 'broccoli': 'ברוקולי', 'cauliflower': 'כרובית',
+    'eggplant': 'חציל', 'zucchini': 'קישוא', 'beans': 'שעועית', 'peas': 'אפונה',
+    'oregano': 'אורגנו', 'thyme': 'טימין', 'rosemary': 'רוזמרין', 'sage': 'מרווה',
+    'stevia': 'סטיביה', 'watercress': 'גרגיר הנחלים', 'dill': 'שמיר', 'mustard': 'חרדל'
+}
+STAGE_NAMES_HE = {
+    'seedling': 'סטרטר', 'vegetative': 'צמיחה', 'fruiting': 'פריחה/פרי',
+    'all': 'כל השלבים', 'vegfruit': 'צמיחה/פרי'
+}
+
+
+def format_plants_for_prompt(plants_list):
+    """ממיר רשימת צמחים מ-RTDB לטקסט קריא ל-Gemini."""
+    if not plants_list:
+        return None
+    parts = []
+    for p in plants_list:
+        pid = p.get('id', '')
+        qty = p.get('qty', 1)
+        stage = p.get('stage', '')
+        name = PLANT_NAMES_HE.get(pid, pid)
+        stage_he = STAGE_NAMES_HE.get(stage, stage)
+        parts.append(f"{name} ({stage_he}) ×{qty}")
+    return ", ".join(parts)
+
+
+def build_consumption_chart_url(history_entries):
+    """בונה URL ל-QuickChart.io עם גרף צריכה יומית של pH ו-EC (שניות).
+    מקסימום 30 ימים אחרונים.
+    """
+    if not history_entries:
+        return None
+    recent = history_entries[-30:]
+    labels = [d.strftime('%d/%m') for d, _ in recent]
+    ph_data = [int(data.get('ph_sec_total', 0) or 0) for _, data in recent]
+    ec_data = [int(data.get('ec_sec_total', 0) or 0) for _, data in recent]
+
+    if all(v == 0 for v in ph_data + ec_data):
+        return None  # אין מה להראות
+
+    chart_config = {
+        "type": "bar",
+        "data": {
+            "labels": labels,
+            "datasets": [
+                {"label": "חומצה (pH) – שניות", "backgroundColor": "#3b82f6", "data": ph_data},
+                {"label": "דשן (EC) – שניות", "backgroundColor": "#10b981", "data": ec_data}
+            ]
+        },
+        "options": {
+            "title": {"display": True, "text": "צריכה יומית במחזור הנוכחי", "fontSize": 16},
+            "legend": {"position": "bottom"},
+            "scales": {"yAxes": [{"ticks": {"beginAtZero": True}, "scaleLabel": {"display": True, "labelString": "שניות הפעלה"}}]}
+        }
+    }
+    encoded = urllib.parse.quote(json.dumps(chart_config, ensure_ascii=False))
+    return f"https://quickchart.io/chart?c={encoded}&w=600&h=350&bkg=white"
 
 # --- משתני סביבה (GitHub Actions secrets) ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -112,35 +177,63 @@ def generate_report(controller_id, settings, history_entries, cycle_start_dt, cy
         today_summary = (f"היום ({d.strftime('%d/%m')}): pH={data.get('ph_avg', 0):.2f}, "
                          f"EC={data.get('ec_avg', 0):.0f}, Temp={data.get('temp_avg', 0):.1f}°C")
 
+    # V13.27+: מידע על הצמחים שגדלים – לדוח מותאם אישית
+    plants_list = settings.get('plants', []) if isinstance(settings, dict) else []
+    plants_text = format_plants_for_prompt(plants_list)
+    plants_section = f"\nצמחים בגידול נוכחי: {plants_text}\n" if plants_text else "\n(לא הוגדרו צמחים ספציפיים בהגדרות.)\n"
+
+    # סיכום צריכת חומרים מצטברת
+    total_ph_sec = sum(int(d.get('ph_sec_total', 0) or 0) for _, d in history_entries)
+    total_ec_sec = sum(int(d.get('ec_sec_total', 0) or 0) for _, d in history_entries)
+    consumption_text = f"\nצריכת חומרים מצטברת במחזור: חומצה pH – {total_ph_sec} שניות, דשן EC – {total_ec_sec} שניות.\n"
+
     prompt = f"""אתה אגרונום מומחה למערכות הידרופוניקה. הפק דוח יומי השוואתי עבור בקר {controller_id}.
 סגנון: {style_text}.
 
 מחזור גידול נוכחי #{cycle_count}, החל ב-{cycle_str} (יום {days_into_cycle} למחזור).
-
+{plants_section}
 יעדי הגידול:
 - טמפרטורה: {targets.get('temp_min')}–{targets.get('temp_max')} °C
 - pH: {targets.get('ph_min')}–{targets.get('ph_max')}
 - EC: {targets.get('ec_min')}–{targets.get('ec_max')} µS
 
 {today_summary}
-
+{consumption_text}
 היסטוריה יומית מאז תחילת המחזור:
 {format_history_for_prompt(history_entries)}
 
 הנחיות לדוח:
-1. סיכום היום (איך עבר היום ביחס ליעדים).
-2. השוואה למחזור עד כה: מגמות, יציבות, חריגות.
-3. ציון נקודות מפנה אם קיימות (יום שבו משהו השתנה משמעותית).
-4. המלצות פרקטיות להמשך המחזור.
+1. **תייחס במפורש לצמחים שהמשתמש מגדל** (אם הוגדרו) – האם היעדים והקריאות מתאימים להם? מה הם דורשים בשלב זה?
+2. סיכום היום (איך עבר היום ביחס ליעדים).
+3. השוואה למחזור עד כה: מגמות, יציבות, חריגות.
+4. ציון נקודות מפנה אם קיימות.
+5. **המלצות פרקטיות ספציפיות לסוג הגידול** (לא המלצות כלליות).
+6. אם הצמחים בשלב פריחה/פרי – שים דגש על EC ושעות תאורה.
+7. אם הצמחים הם עלים – שים דגש על pH ויציבות.
 
-החזר אך ורק את תוכן הדוח בפורמט Markdown בעברית."""
+החזר אך ורק את תוכן הדוח בפורמט Markdown בעברית. השתמש בכותרות ## ובהדגשות **."""
 
     response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
     return response.text
 
 
-def send_report_email(client_email, controller_id, report_md, cycle_count, days_into_cycle):
+def send_report_email(client_email, controller_id, report_md, cycle_count, days_into_cycle, chart_url=None, plants_text=None):
     html_body = markdown.markdown(report_md)
+    plants_html = ""
+    if plants_text:
+        plants_html = f"""
+        <div style="background: #f0fdf4; padding: 10px 15px; margin: 0; border-bottom: 1px solid #bbf7d0; text-align: right;">
+            <span style="color: #15803d; font-weight: bold;">🌱 גידול נוכחי:</span>
+            <span style="color: #166534;"> {plants_text}</span>
+        </div>"""
+    chart_html = ""
+    if chart_url:
+        chart_html = f"""
+        <div style="padding: 20px; background: #fafafa; border-top: 1px solid #eee; text-align: center;">
+            <h3 style="margin: 0 0 10px 0; color: #374151;">📊 גרף צריכת חומרים – כל יום במחזור</h3>
+            <img src="{chart_url}" alt="צריכת חומרים יומית" style="max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 8px;">
+            <p style="font-size: 11px; color: #6b7280; margin-top: 8px;">כל עמודה = יום אחד במחזור. שניות הפעלה של משאבת חומצה (כחול) ודשן (ירוק).</p>
+        </div>"""
     html_template = f"""
 <!DOCTYPE html>
 <html lang="he" dir="rtl">
@@ -151,7 +244,9 @@ def send_report_email(client_email, controller_id, report_md, cycle_count, days_
             <h1>דוח אגרונומי יומי</h1>
             <p>בקר: {controller_id} | מחזור #{cycle_count} | יום {days_into_cycle}</p>
         </div>
+        {plants_html}
         <div style="padding: 20px;">{html_body}</div>
+        {chart_html}
         <div style="background: #f8fafc; padding: 10px; text-align: center; font-size: 12px;">
             &copy; 2026 SmartHydro Systems
         </div>
@@ -238,11 +333,14 @@ def process_all_controllers():
         except Exception as e_save:
             print(f"[{controller_id}] RTDB save warning: {e_save}")
 
-        # 8. שליחת email
+        # 8. שליחת email – עם גרף צריכה ומידע על צמחים
         try:
             days_into_cycle = (datetime.now().date() - cycle_start_dt.date()).days if cycle_start_dt else 0
-            send_report_email(owner_email, controller_id, report_md, cycle_count, days_into_cycle)
-            print(f"[{controller_id}] Report sent to {owner_email}")
+            chart_url = build_consumption_chart_url(history)
+            plants_text = format_plants_for_prompt(settings.get('plants', []) if isinstance(settings, dict) else [])
+            send_report_email(owner_email, controller_id, report_md, cycle_count, days_into_cycle,
+                              chart_url=chart_url, plants_text=plants_text)
+            print(f"[{controller_id}] Report sent to {owner_email} (chart={'yes' if chart_url else 'no'})")
         except Exception as e_email:
             print(f"[{controller_id}] Email error: {e_email}")
 
