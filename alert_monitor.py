@@ -13,7 +13,10 @@ SmartHydro Alert Monitor
 import os
 import json
 import time
+import smtplib
 from datetime import datetime, timezone, timedelta
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 import firebase_admin
 from firebase_admin import credentials, db, messaging
@@ -29,6 +32,17 @@ IST_OFFSET = 3  # IDT (קיץ). חורף = 2. לצורך MVP – ניקח 3.
 
 CRITICAL_ALERTS = {"pump_lock", "controller_offline"}  # תמיד נשלחות גם בשעות שקט
 TIER_ALLOWED = ("pro", "pro_plus")
+
+# הגדרות שליחת משוב
+FEEDBACK_TO_EMAIL = "smarthydro.il@gmail.com"
+SENDER_EMAIL = os.getenv("GMAIL_USER")
+SENDER_PASSWORD = os.getenv("GMAIL_PASS")
+FEEDBACK_TYPE_LABELS = {
+    "bug": "🐛 באג / תקלה",
+    "feature": "💡 רעיון לשיפור",
+    "question": "❓ שאלה",
+    "other": "📌 אחר"
+}
 
 # ----------- אתחול Firebase Admin -----------
 DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL")
@@ -205,6 +219,79 @@ def evaluate_controller(mac: str, cdata: dict):
             try_send("water_low", f"מפלס מים נמוך מאוד ({pct:.0f}%). מלא את המאגר.")
 
 
+def send_feedback_email(entry_id: str, entry: dict):
+    """שולח מייל לצוות SmartHydro עם פנייה חדשה."""
+    if not SENDER_EMAIL or not SENDER_PASSWORD:
+        print(f"  [feedback-skip] {entry_id}: no email credentials")
+        return False
+    fb_type = entry.get("type", "other")
+    type_label = FEEDBACK_TYPE_LABELS.get(fb_type, fb_type)
+    user_email = entry.get("user_email", "?")
+    controller_id = entry.get("controller_id", "?")
+    message = entry.get("message", "")
+    ua = entry.get("user_agent", "")[:120]
+    created = datetime.fromtimestamp(entry.get("created_at", time.time()))
+
+    subject = f"[SmartHydro] {type_label} מ-{user_email}"
+    html = f"""<!DOCTYPE html>
+<html lang="he" dir="rtl"><head><meta charset="UTF-8"></head>
+<body style="font-family:sans-serif;direction:rtl;padding:20px;">
+  <div style="max-width:600px;margin:0 auto;border:1px solid #ddd;border-radius:10px;overflow:hidden;">
+    <div style="background:#0891b2;color:white;padding:15px;"><h2 style="margin:0;">{type_label}</h2></div>
+    <div style="padding:20px;">
+      <p><b>מאת:</b> {user_email}</p>
+      <p><b>בקר:</b> {controller_id}</p>
+      <p><b>תאריך:</b> {created.strftime('%d/%m/%Y %H:%M')}</p>
+      <hr>
+      <div style="background:#f9fafb;padding:15px;border-radius:8px;white-space:pre-wrap;">{message}</div>
+      <p style="font-size:11px;color:#9ca3af;margin-top:20px;">User-Agent: {ua}</p>
+    </div>
+  </div>
+</body></html>"""
+    msg = MIMEMultipart('alternative')
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = FEEDBACK_TO_EMAIL
+    msg['Reply-To'] = user_email
+    msg['Subject'] = subject
+    msg.attach(MIMEText(html, 'html', 'utf-8'))
+    try:
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        print(f"  [feedback-ok] {entry_id} sent to {FEEDBACK_TO_EMAIL}")
+        return True
+    except Exception as e:
+        print(f"  [feedback-err] {entry_id}: {e}")
+        return False
+
+
+def process_feedback():
+    """עובר על פניות חדשות (emailed=false), שולח מייל, ומסמן emailed=true."""
+    try:
+        feedback = db.reference("feedback").get() or {}
+    except Exception as e:
+        print(f"[feedback-fetch] {e}")
+        return
+    new_count = 0
+    for entry_id, entry in feedback.items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("emailed"):
+            continue
+        new_count += 1
+        ok = send_feedback_email(entry_id, entry)
+        if ok:
+            try:
+                db.reference(f"feedback/{entry_id}/emailed").set(True)
+                db.reference(f"feedback/{entry_id}/emailed_at").set(int(time.time()))
+            except Exception as e:
+                print(f"  [feedback-mark] {entry_id}: {e}")
+    if new_count:
+        print(f"Processed {new_count} feedback entries.")
+
+
 def main():
     controllers = db.reference("controllers").get() or {}
     total = 0
@@ -217,6 +304,8 @@ def main():
         except Exception as e:
             print(f"[err] {mac}: {e}")
     print(f"Processed {total} controllers. Quiet hours: {is_quiet_hours()}")
+    # עיבוד פניות משוב חדשות
+    process_feedback()
 
 
 if __name__ == "__main__":
