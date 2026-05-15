@@ -292,6 +292,99 @@ def process_feedback():
         print(f"Processed {new_count} feedback entries.")
 
 
+def check_calibration_reminder(mac: str, cdata: dict):
+    """תזכורת כיול שנתית – אם עברה שנה מאז הכיול האחרון, שולח מייל ללקוח.
+    משתמש ב-controllers/{MAC}/last_calibration/ts (epoch) כתאריך הכיול האחרון.
+    אם לא קיים – משתמש ב-installation_date (כעת לא קיים ב-RTDB, אז dilemma).
+    ל-MVP: רק אם יש last_calibration. אם אין – לא מטריד.
+
+    Anti-spam: לא שולח שוב במשך 30 ימים מאז התזכורת האחרונה.
+    """
+    sub = cdata.get("subscription") or {}
+    tier = sub.get("tier", "free")
+    if tier not in TIER_ALLOWED:
+        return False  # רק PRO/PRO+ מקבלים תזכורות
+
+    last_cal = cdata.get("last_calibration") or {}
+    last_cal_ts = last_cal.get("ts", 0) if isinstance(last_cal, dict) else 0
+    if not last_cal_ts:
+        return False
+
+    now = now_ts()
+    days_since_cal = (now - last_cal_ts) / 86400
+    if days_since_cal < 365:
+        return False  # עוד לא עברה שנה
+
+    # בדיקת anti-spam: התזכורת האחרונה הייתה לפני יותר מ-30 יום?
+    meta = cdata.get("meta") or {}
+    last_reminder = meta.get("cal_reminder_sent_at", 0) if isinstance(meta, dict) else 0
+    if last_reminder and (now - last_reminder) < (30 * 86400):
+        return False  # נשלח לאחרונה
+
+    owner_email = cdata.get("owner_email") or ""
+    if not owner_email:
+        return False
+
+    settings = cdata.get("settings") or {}
+    device_name = settings.get("deviceName") or mac
+
+    # שליחת המייל
+    ok = send_calibration_reminder_email(owner_email, mac, device_name, int(days_since_cal))
+    if ok:
+        try:
+            db.reference(f"controllers/{mac}/meta").update({"cal_reminder_sent_at": now})
+            print(f"  [cal-reminder] {mac} ({device_name}): sent to {owner_email} ({int(days_since_cal)} days since last cal)")
+        except Exception as e:
+            print(f"  [cal-reminder-mark] {mac}: {e}")
+    return ok
+
+
+def send_calibration_reminder_email(to_email: str, mac: str, device_name: str, days_since: int) -> bool:
+    if not SENDER_EMAIL or not SENDER_PASSWORD:
+        return False
+    html = f"""<!DOCTYPE html>
+<html lang="he" dir="rtl"><head><meta charset="UTF-8"></head>
+<body style="font-family:sans-serif;direction:rtl;padding:20px;background:#f3f4f6;">
+  <div style="max-width:600px;margin:0 auto;background:white;border-radius:16px;overflow:hidden;box-shadow:0 4px 12px rgba(0,0,0,0.05);">
+    <div style="background:linear-gradient(135deg,#0891b2,#06b6d4);color:white;padding:30px;text-align:center;">
+      <div style="font-size:48px;margin-bottom:10px;">🎯</div>
+      <h1 style="margin:0;font-size:22px;">הגיע הזמן לכיול שנתי</h1>
+    </div>
+    <div style="padding:30px;line-height:1.6;">
+      <p>שלום,</p>
+      <p>הבקר ההידרופוני שלך <b>{device_name}</b> כויל לאחרונה לפני <b>{days_since} ימים</b>.</p>
+      <p>אנו ממליצים על כיול שנתי של חיישני ה-pH וה-EC כדי לשמור על דיוק הקריאות והבטיחות של מערכת ההזרקה.</p>
+      <div style="background:#ecfeff;border-right:4px solid #06b6d4;padding:15px;border-radius:8px;margin:20px 0;">
+        <h3 style="margin:0 0 10px 0;color:#0891b2;">איך לתאם כיול?</h3>
+        <p style="margin:0;">השב למייל זה או צור קשר ב-WhatsApp:<br>
+        📩 <a href="mailto:smarthydro.il@gmail.com">smarthydro.il@gmail.com</a><br>
+        💬 <a href="https://wa.me/972526730423">0526730423</a></p>
+      </div>
+      <p style="font-size:13px;color:#6b7280;">מומלץ לתאם הגעה לפני שתבחין בקריאות לא יציבות. כיול עצמאי אפשרי דרך אפליקציית SmartHydro תחת "הגדרות → כיול חיישנים".</p>
+      <p style="color:#6b7280;font-size:13px;margin-top:30px;">עם הוקרה,<br>שמעון – SmartHydro Systems</p>
+    </div>
+    <div style="background:#f9fafb;padding:12px;text-align:center;font-size:11px;color:#9ca3af;">
+      תזכורת זו נשלחה אחת לשנה. בקר: {device_name}
+    </div>
+  </div>
+</body></html>"""
+    msg = MIMEMultipart('alternative')
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = to_email
+    msg['Subject'] = f"🎯 הגיע הזמן לכיול שנתי של {device_name}"
+    msg.attach(MIMEText(html, 'html', 'utf-8'))
+    try:
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        return True
+    except Exception as e:
+        print(f"  [cal-email-err] {to_email}: {e}")
+        return False
+
+
 def enforce_subscription_expiry(mac: str, cdata: dict):
     """אם המנוי פג תוקף – מוריד את ה-tier ל-free וגורר expiresAt.
     קריטי לאכיפת מודל החיוב.
@@ -324,20 +417,23 @@ def main():
     controllers = db.reference("controllers").get() or {}
     total = 0
     downgraded = 0
+    cal_reminders = 0
     for mac, cdata in controllers.items():
         if not isinstance(cdata, dict):
             continue
         total += 1
         try:
-            # אכיפת תוקף לפני בדיקת התראות (כדי שלא נשלח push למי שכבר Free)
+            # אכיפת תוקף לפני בדיקת התראות
             if enforce_subscription_expiry(mac, cdata):
                 downgraded += 1
-                # רענון cdata אחרי שינוי
                 cdata = db.reference(f"controllers/{mac}").get() or cdata
+            # תזכורת כיול שנתית
+            if check_calibration_reminder(mac, cdata):
+                cal_reminders += 1
             evaluate_controller(mac, cdata)
         except Exception as e:
             print(f"[err] {mac}: {e}")
-    print(f"Processed {total} controllers. Downgraded: {downgraded}. Quiet hours: {is_quiet_hours()}")
+    print(f"Processed {total} controllers. Downgraded: {downgraded}. Calibration reminders: {cal_reminders}. Quiet hours: {is_quiet_hours()}")
     # עיבוד פניות משוב חדשות
     process_feedback()
 
