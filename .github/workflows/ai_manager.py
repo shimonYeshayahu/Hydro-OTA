@@ -287,16 +287,59 @@ def generate_report(controller_id, settings, history_entries, cycle_start_dt, cy
 - אם מחזור צעיר (פחות מ-3 ימים) — ציין שאין מספיק נתונים לניתוח.
 - Markdown בעברית, כותרות ## והדגשות **. טבלאות בפורמט |---|."""
 
-    response = _gemini_generate_with_retry(prompt)
+    response = _gemini_generate_with_fallback(prompt)
     return response.text
+
+
+# V25.27: Multi-model fallback chain.
+# Each model has its own retry-with-backoff. If one model completely exhausts retries,
+# we move to the next model in the chain. The 3 models share similar quality for
+# agronomic reports but draw from DIFFERENT capacity pools at Google's side, so they
+# rarely all go down at once.
+#
+# Models in priority order:
+#   1. gemini-2.5-flash      — primary (best balance)
+#   2. gemini-2.0-flash      — different generation, separate capacity pool
+#   3. gemini-1.5-flash      — legacy, very stable, almost never busy
+#
+# Free-tier limits per model are independent, so this also TRIPLES our daily quota.
+_FALLBACK_MODEL_CHAIN = [
+    'gemini-2.5-flash',
+    'gemini-2.0-flash',
+    'gemini-1.5-flash',
+]
+
+
+def _gemini_generate_with_fallback(prompt):
+    """Try each model in the chain. Returns response from first success.
+    Raises last exception only if ALL models fail across ALL retries.
+    """
+    last_exc = None
+    for i, model in enumerate(_FALLBACK_MODEL_CHAIN):
+        try:
+            print(f"  Trying model {i+1}/{len(_FALLBACK_MODEL_CHAIN)}: {model}")
+            return _gemini_generate_with_retry(prompt, model=model)
+        except Exception as e:
+            last_exc = e
+            err_str = str(e)[:150]
+            is_last_model = (i == len(_FALLBACK_MODEL_CHAIN) - 1)
+            if is_last_model:
+                print(f"  ALL MODELS EXHAUSTED — final failure on {model}: {err_str}")
+                raise
+            print(f"  Model {model} exhausted retries: {err_str}")
+            print(f"  Falling through to next model in chain...")
+    # Defensive — should never reach here
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Fallback chain exited unexpectedly")
 
 
 # V25.24: Retry transient Gemini errors (503 UNAVAILABLE, 429 RESOURCE_EXHAUSTED, etc.)
 # Without this, the daily cron at 06:00 UTC fails silently when Google has a load spike,
 # and customers lose their daily report for that day with no explanation.
 def _gemini_generate_with_retry(prompt, model='gemini-2.5-flash', max_attempts=3):
-    """Call Gemini with exponential backoff on transient errors.
-    Delays: 5s -> 15s -> 30s. Total worst case: ~50s extra.
+    """Call a SPECIFIC model with exponential backoff on transient errors.
+    Delays: 5s -> 15s -> 30s. Total worst case per model: ~50s.
     Raises the last exception if all attempts fail.
     """
     transient_markers = ('503', '429', 'UNAVAILABLE', 'RESOURCE_EXHAUSTED',
@@ -313,15 +356,15 @@ def _gemini_generate_with_retry(prompt, model='gemini-2.5-flash', max_attempts=3
             is_transient = any(m in err_str for m in transient_markers)
             is_last = (attempt == max_attempts - 1)
             if not is_transient or is_last:
-                # Permanent error OR ran out of attempts — give up
-                print(f"  Gemini call FAILED (attempt {attempt+1}/{max_attempts}): {err_str[:200]}")
+                # Permanent error OR ran out of attempts — give up THIS model
+                print(f"    [{model}] FAILED (attempt {attempt+1}/{max_attempts}): {err_str[:200]}")
                 raise
             delay = delays[attempt]
-            print(f"  Gemini transient error (attempt {attempt+1}/{max_attempts}), "
+            print(f"    [{model}] transient error (attempt {attempt+1}/{max_attempts}), "
                   f"retrying in {delay}s: {err_str[:120]}")
             time.sleep(delay)
     # Should never reach here but for safety:
-    raise last_exc if last_exc else RuntimeError("Gemini retry loop exited unexpectedly")
+    raise last_exc if last_exc else RuntimeError("Retry loop exited unexpectedly")
 
 
 def send_report_email(client_email, controller_id, report_md, cycle_count, days_into_cycle, chart_url=None, plants_text=None, device_name=None):
