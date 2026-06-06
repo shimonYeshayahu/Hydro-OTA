@@ -297,59 +297,118 @@ def send_report_email(client_email, controller_id, report_md, cycle_count, days_
     # and converts single newlines to <br> for better paragraph spacing.
     html_body = markdown.markdown(report_md, extensions=['tables', 'nl2br'])
     friendly_name = device_name if device_name else "SmartHydro"
-    plants_html = ""
-    if plants_text:
-        plants_html = f"""
-        <div style="background: #f0fdf4; padding: 10px 15px; margin: 0; border-bottom: 1px solid #bbf7d0; text-align: right;">
-            <span style="color: #15803d; font-weight: bold;">🌱 גידול נוכחי:</span>
-            <span style="color: #166534;"> {plants_text}</span>
-        </div>"""
+    # V25.25: email-client-safe chart row (table-based, not div)
     chart_html = ""
     if chart_url:
         chart_html = f"""
-        <div style="padding: 20px; background: #fafafa; border-top: 1px solid #eee; text-align: center;">
-            <h3 style="margin: 0 0 10px 0; color: #374151;">📊 גרף צריכת חומרים – כל יום במחזור</h3>
-            <img src="{chart_url}" alt="צריכת חומרים יומית" style="max-width: 100%; height: auto; border: 1px solid #ddd; border-radius: 8px;">
-            <p style="font-size: 11px; color: #6b7280; margin-top: 8px;">כל עמודה = יום אחד במחזור. שניות הפעלה של משאבת חומצה (כחול) ודשן (ירוק).</p>
-        </div>"""
+        <tr>
+          <td style="padding:24px 20px;background:#fafafa;border-top:1px solid #e5e7eb;text-align:center;">
+            <div style="font-size:14px;font-weight:bold;color:#374151;margin-bottom:12px;">📊 גרף צריכת חומרים – כל יום במחזור</div>
+            <img src="{chart_url}" alt="צריכת חומרים יומית" style="max-width:100%;height:auto;border:1px solid #e5e7eb;border-radius:8px;display:block;margin:0 auto;">
+            <div style="font-size:11px;color:#6b7280;margin-top:10px;line-height:1.5;">כל עמודה = יום אחד במחזור. שניות הפעלה של משאבת חומצה (כחול) ודשן (ירוק).</div>
+          </td>
+        </tr>"""
     else:
         chart_html = """
-        <div style="padding: 15px; background: #fafafa; border-top: 1px solid #eee; text-align: center; color: #9ca3af; font-size: 12px;">
+        <tr>
+          <td style="padding:16px;background:#fafafa;border-top:1px solid #e5e7eb;text-align:center;color:#9ca3af;font-size:12px;">
             📊 גרף הצריכה יופיע כשיצטברו נתונים יומיים (החל מהיום השני במחזור).
-        </div>"""
-    # V25.24: inline CSS for clean tables + readable text inside the body
+          </td>
+        </tr>"""
+
+    # V25.25: plants_html wrapped as table row for email-safe layout
+    plants_html_row = ""
+    if plants_text:
+        plants_html_row = f"""
+        <tr>
+          <td style="background:#f0fdf4;padding:12px 20px;border-bottom:1px solid #bbf7d0;text-align:right;font-size:13px;">
+            <span style="color:#15803d;font-weight:bold;">🌱 גידול נוכחי:</span>
+            <span style="color:#166534;"> {plants_text}</span>
+          </td>
+        </tr>"""
+
+    # V25.25: Email-client-safe CSS in <style> tag (Gmail respects it; Outlook ignores
+    # but inline styles below provide fallback). Keep selectors simple, no nesting.
     body_styles = """
     <style>
-        .report-body { font-family: 'Heebo', sans-serif; color: #1f2937; line-height: 1.6; font-size: 14px; }
-        .report-body h2 { color: #6d28d9; border-bottom: 2px solid #ede9fe; padding-bottom: 6px; margin-top: 20px; font-size: 18px; }
-        .report-body h3 { color: #374151; margin-top: 16px; font-size: 15px; }
-        .report-body p { margin: 8px 0; }
-        .report-body strong { color: #6d28d9; }
-        .report-body table { border-collapse: collapse; width: 100%; margin: 12px 0; background: #fafafa; border-radius: 8px; overflow: hidden; }
-        .report-body th { background: #ede9fe; color: #5b21b6; padding: 10px; text-align: right; font-weight: bold; border-bottom: 2px solid #ddd6fe; }
-        .report-body td { padding: 10px; text-align: right; border-bottom: 1px solid #e5e7eb; }
-        .report-body tr:last-child td { border-bottom: none; }
-        .report-body ul, .report-body ol { padding-right: 22px; padding-left: 0; }
-        .report-body li { margin: 6px 0; }
-        .report-body hr { border: none; border-top: 1px solid #e5e7eb; margin: 16px 0; }
+      /* Gmail/web client typography */
+      .report-content { font-family: 'Heebo','Segoe UI',Arial,sans-serif; color:#1f2937; font-size:15px; line-height:1.85; }
+      .report-content h2 { color:#6d28d9; font-size:18px; font-weight:700; margin:24px 0 10px 0; padding-bottom:6px; border-bottom:2px solid #ede9fe; }
+      .report-content h3 { color:#374151; font-size:15px; font-weight:700; margin:18px 0 8px 0; }
+      .report-content p { margin:10px 0; }
+      .report-content strong { color:#5b21b6; font-weight:700; }
+      .report-content em { color:#6b7280; font-style:normal; font-size:13px; }
+      .report-content table { border-collapse:collapse; width:100%; margin:14px 0; background:#fafafa; border-radius:8px; overflow:hidden; }
+      .report-content th { background:#ede9fe; color:#5b21b6; padding:10px 12px; text-align:right; font-weight:700; font-size:13px; border-bottom:2px solid #ddd6fe; }
+      .report-content td { padding:10px 12px; text-align:right; font-size:14px; border-bottom:1px solid #e5e7eb; }
+      .report-content tr:last-child td { border-bottom:none; }
+      .report-content ol, .report-content ul { padding-right:0; padding-left:0; margin:14px 0; list-style:none; counter-reset:rec-counter; }
+      .report-content ol li, .report-content ul li {
+        background:#f9fafb; border-right:3px solid #8b5cf6; border-radius:6px;
+        padding:12px 16px; margin:8px 0; font-size:14px; line-height:1.7; position:relative;
+      }
+      .report-content ol li { counter-increment:rec-counter; padding-right:50px; }
+      .report-content ol li:before {
+        content:counter(rec-counter); position:absolute; right:14px; top:12px;
+        background:#8b5cf6; color:#fff; width:24px; height:24px; border-radius:50%;
+        text-align:center; line-height:24px; font-size:13px; font-weight:700;
+      }
+      .report-content hr { border:none; border-top:1px solid #e5e7eb; margin:18px 0; }
+      .report-content code { background:#f3f4f6; color:#5b21b6; padding:1px 6px; border-radius:4px; font-family:monospace; font-size:13px; }
+      /* Mobile */
+      @media only screen and (max-width:600px) {
+        .report-content { font-size:14px; }
+        .report-content td, .report-content th { padding:8px; font-size:12px; }
+        .report-content ol li, .report-content ul li { padding:10px 12px; }
+        .report-content ol li { padding-right:42px; }
+      }
     </style>"""
-    html_template = f"""
-<!DOCTYPE html>
+
+    # V25.25: Table-based layout for email-client compatibility (Outlook!).
+    # max-width on a single <table> is honored by all major clients.
+    html_template = f"""<!DOCTYPE html>
 <html lang="he" dir="rtl">
-<head><meta charset="UTF-8">{body_styles}</head>
-<body style="font-family: 'Heebo', sans-serif; direction: rtl; text-align: right; padding: 20px; background: #f3f4f6;">
-    <div style="max-width: 640px; margin: 0 auto; background: white; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden;">
-        <div style="background: linear-gradient(135deg, #8b5cf6, #6d28d9); color: white; padding: 22px; text-align: center;">
-            <h1 style="margin: 0; font-size: 22px;">דוח אגרונומי יומי</h1>
-            <p style="margin: 8px 0 0 0; opacity: 0.92; font-size: 13px;">{friendly_name} · מחזור #{cycle_count} · יום {days_into_cycle}</p>
-        </div>
-        {plants_html}
-        <div class="report-body" style="padding: 22px;">{html_body}</div>
-        {chart_html}
-        <div style="background: #f8fafc; padding: 12px; text-align: center; font-size: 11px; color: #6b7280;">
-            &copy; 2026 SmartHydro Systems
-        </div>
-    </div>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>דוח אגרונומי</title>
+{body_styles}
+</head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:'Heebo','Segoe UI',Arial,sans-serif;direction:rtl;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f3f4f6;">
+    <tr>
+      <td align="center" style="padding:24px 12px;">
+        <table role="presentation" width="640" cellpadding="0" cellspacing="0" border="0" style="max-width:640px;width:100%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,0.06);">
+
+          <!-- Header -->
+          <tr>
+            <td style="background:#6d28d9;background-image:linear-gradient(135deg,#8b5cf6,#6d28d9);color:#ffffff;padding:26px 24px;text-align:center;">
+              <div style="font-size:22px;font-weight:700;margin-bottom:6px;">דוח אגרונומי יומי</div>
+              <div style="font-size:13px;opacity:0.92;">{friendly_name} &middot; מחזור #{cycle_count} &middot; יום {days_into_cycle}</div>
+            </td>
+          </tr>
+
+          {plants_html_row}
+
+          <!-- Content -->
+          <tr>
+            <td class="report-content" style="padding:28px 28px 24px 28px;font-family:'Heebo','Segoe UI',Arial,sans-serif;color:#1f2937;font-size:15px;line-height:1.85;text-align:right;direction:rtl;">
+              {html_body}
+            </td>
+          </tr>
+
+          {chart_html}
+
+          <!-- Footer -->
+          <tr>
+            <td style="background:#f8fafc;padding:14px;text-align:center;font-size:11px;color:#6b7280;">
+              &copy; 2026 SmartHydro Systems
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
 </body>
 </html>"""
     msg = MIMEMultipart('alternative')
