@@ -421,6 +421,21 @@ def process_all_controllers():
 
     now_ts = datetime.now().timestamp()
     today_str = datetime.now().strftime('%Y-%m-%d')
+    run_start_ts = now_ts
+
+    # V25.24: monitoring counters — saved to RTDB + alert if error rate high
+    stats = {
+        'total_controllers': len(all_controllers),
+        'sent_ok': 0,
+        'gemini_errors': 0,
+        'tier_blocked': 0,
+        'expired': 0,
+        'offline': 0,
+        'no_owner_email': 0,
+        'opted_out': 0,
+        'email_errors': 0,
+        'rtdb_save_errors': 0,
+    }
 
     for controller_id, data in all_controllers.items():
         print(f"\n[{controller_id}] -----------------------------------")
@@ -432,11 +447,13 @@ def process_all_controllers():
         tier = sub.get('tier', 'free')
         if tier not in REPORT_TIERS:
             print(f"[{controller_id}] Skipped: tier={tier}")
+            stats['tier_blocked'] += 1
             continue
         # תוקף פג? עדיין נשלח דוח אם זה הוא יום התפוגה (לקוח אמור לקבל אישור עד הרגע האחרון)
         expires_at = sub.get('expiresAt', 0)
         if expires_at and expires_at < now_ts:
             print(f"[{controller_id}] Skipped: subscription expired")
+            stats['expired'] += 1
             continue
 
         # 2. בדיקת דופק (realtime/lastUpdate בתוך 24h אחרונות)
@@ -444,12 +461,14 @@ def process_all_controllers():
         last_update = realtime.get('lastUpdate', 0) or 0
         if now_ts - last_update > 86400:
             print(f"[{controller_id}] Skipped: offline (last_update={last_update})")
+            stats['offline'] += 1
             continue
 
         # 3. owner email
         owner_email = data.get('owner_email') or ''
         if not owner_email:
             print(f"[{controller_id}] Skipped: no owner_email")
+            stats['no_owner_email'] += 1
             continue
 
         # PWA v25: בדיקת email_prefs של המשתמש
@@ -457,6 +476,7 @@ def process_all_controllers():
         should_send, reason = should_send_today(email_prefs)
         if not should_send:
             print(f"[{controller_id}] Skipped email (per user prefs): {reason}")
+            stats['opted_out'] += 1
             continue
         report_style = (email_prefs or {}).get('style', 'brief')
 
@@ -477,6 +497,7 @@ def process_all_controllers():
                                         device_name=device_name, report_style=report_style)
         except Exception as e_gen:
             print(f"[{controller_id}] Gemini error: {e_gen}")
+            stats['gemini_errors'] += 1
             continue
 
         # 7. שמירה ב-RTDB (כדי שהדשבורד יוכל להציג)
@@ -488,6 +509,7 @@ def process_all_controllers():
             })
         except Exception as e_save:
             print(f"[{controller_id}] RTDB save warning: {e_save}")
+            stats['rtdb_save_errors'] += 1
 
         # 8. שליחת email – עם גרף צריכה ומידע על צמחים
         try:
@@ -497,8 +519,100 @@ def process_all_controllers():
             send_report_email(owner_email, controller_id, report_md, cycle_count, days_into_cycle,
                               chart_url=chart_url, plants_text=plants_text, device_name=device_name)
             print(f"[{controller_id}] Report sent to {owner_email} (chart={'yes' if chart_url else 'no'})")
+            stats['sent_ok'] += 1
         except Exception as e_email:
             print(f"[{controller_id}] Email error: {e_email}")
+            stats['email_errors'] += 1
+
+    # V25.24: monitoring — save run stats to Firebase + alert if errors are high
+    _save_and_alert_run_stats(stats, run_start_ts)
+
+
+def _save_and_alert_run_stats(stats, run_start_ts):
+    """Persist run statistics to Firebase RTDB and send admin alert if error rate exceeds threshold.
+    Saves to system/ai_manager_stats/last (overwritten each run) AND
+    system/ai_manager_stats/history/{YYYY-MM-DD} (one entry per day).
+    """
+    run_end_ts = datetime.now().timestamp()
+    eligible = (stats['sent_ok'] + stats['gemini_errors'] + stats['email_errors']
+                + stats['rtdb_save_errors'])
+    error_count = stats['gemini_errors'] + stats['email_errors']
+    error_rate = (error_count / eligible) if eligible > 0 else 0.0
+
+    full_stats = {
+        **stats,
+        'eligible': eligible,
+        'error_count': error_count,
+        'error_rate': round(error_rate, 4),
+        'run_duration_sec': round(run_end_ts - run_start_ts, 1),
+        'run_finished_at': int(run_end_ts),
+        'run_date': datetime.now().strftime('%Y-%m-%d'),
+    }
+
+    print(f"\n=== Run summary ===")
+    for k, v in full_stats.items():
+        print(f"  {k}: {v}")
+
+    # Save to Firebase
+    try:
+        db.reference('system/ai_manager_stats/last').set(full_stats)
+        db.reference(f"system/ai_manager_stats/history/{full_stats['run_date']}").set(full_stats)
+        print("  Stats saved to Firebase: system/ai_manager_stats/")
+    except Exception as e:
+        print(f"  WARNING: failed to save stats to Firebase: {e}")
+
+    # Alert if error rate > 10% AND at least 1 eligible controller (avoid false alert at scale 0)
+    ALERT_THRESHOLD = 0.10
+    ADMIN_EMAIL = 'smarthydro.il@gmail.com'
+    if eligible > 0 and error_rate > ALERT_THRESHOLD:
+        try:
+            _send_admin_alert(ADMIN_EMAIL, full_stats)
+            print(f"  ALERT EMAIL SENT to {ADMIN_EMAIL} — error rate {error_rate*100:.1f}%")
+        except Exception as e:
+            print(f"  ALERT EMAIL FAILED: {e}")
+
+
+def _send_admin_alert(admin_email, stats):
+    """Sends a plain-text alert email to the admin when run had too many errors."""
+    subject = f"⚠️ SmartHydro AI Manager — error rate {stats['error_rate']*100:.1f}% on {stats['run_date']}"
+    body = f"""SmartHydro AI Manager run finished with high error rate.
+
+Run date: {stats['run_date']}
+Run duration: {stats['run_duration_sec']}s
+
+Counts:
+  Total controllers seen:    {stats['total_controllers']}
+  Eligible (passed gates):   {stats['eligible']}
+  Reports sent OK:           {stats['sent_ok']}
+  Gemini errors:             {stats['gemini_errors']}
+  Email errors:              {stats['email_errors']}
+  RTDB save errors:          {stats['rtdb_save_errors']}
+
+Filtered out (normal):
+  tier_blocked:    {stats['tier_blocked']}
+  expired:         {stats['expired']}
+  offline:         {stats['offline']}
+  no_owner_email:  {stats['no_owner_email']}
+  opted_out:       {stats['opted_out']}
+
+Error rate: {stats['error_rate']*100:.2f}% (threshold: 10%)
+
+Check GitHub Actions logs:
+https://github.com/shimonYeshayahu/Hydro-OTA/actions
+
+Or Firebase Console:
+https://console.firebase.google.com/project/smarthydrosystem-e27fe/database/smarthydrosystem-e27fe-default-rtdb/data/~2Fsystem~2Fai_manager_stats
+"""
+    msg = MIMEText(body, 'plain', 'utf-8')
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = admin_email
+    msg['Subject'] = subject
+
+    server = smtplib.SMTP('smtp.gmail.com', 587)
+    server.starttls()
+    server.login(SENDER_EMAIL, SENDER_PASSWORD)
+    server.send_message(msg)
+    server.quit()
 
 
 if __name__ == "__main__":
