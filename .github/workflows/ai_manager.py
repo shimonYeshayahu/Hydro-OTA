@@ -327,25 +327,27 @@ def send_report_email(client_email, controller_id, report_md, cycle_count, days_
           </td>
         </tr>"""
 
-    # V25.25: Email-client-safe CSS in <style> tag (Gmail respects it; Outlook ignores
-    # but inline styles below provide fallback). Keep selectors simple, no nesting.
+    # V25.26: Email-client CSS. Inner tables MUST use table-layout:fixed +
+    # width:100% so long text doesn't push them past 584px (640 - 56 padding).
     body_styles = """
     <style>
       /* Gmail/web client typography */
-      .report-content { font-family: 'Heebo','Segoe UI',Arial,sans-serif; color:#1f2937; font-size:15px; line-height:1.85; }
+      .report-content { font-family: 'Heebo','Segoe UI',Arial,sans-serif; color:#1f2937; font-size:15px; line-height:1.85; max-width:584px; }
       .report-content h2 { color:#6d28d9; font-size:18px; font-weight:700; margin:24px 0 10px 0; padding-bottom:6px; border-bottom:2px solid #ede9fe; }
       .report-content h3 { color:#374151; font-size:15px; font-weight:700; margin:18px 0 8px 0; }
-      .report-content p { margin:10px 0; }
+      .report-content p { margin:10px 0; max-width:584px; word-wrap:break-word; }
       .report-content strong { color:#5b21b6; font-weight:700; }
       .report-content em { color:#6b7280; font-style:normal; font-size:13px; }
-      .report-content table { border-collapse:collapse; width:100%; margin:14px 0; background:#fafafa; border-radius:8px; overflow:hidden; }
-      .report-content th { background:#ede9fe; color:#5b21b6; padding:10px 12px; text-align:right; font-weight:700; font-size:13px; border-bottom:2px solid #ddd6fe; }
-      .report-content td { padding:10px 12px; text-align:right; font-size:14px; border-bottom:1px solid #e5e7eb; }
+      /* Inner tables from Markdown — constrain to content width */
+      .report-content table { border-collapse:collapse; width:100% !important; max-width:584px; margin:14px 0; background:#fafafa; border-radius:8px; table-layout:fixed; }
+      .report-content th { background:#ede9fe; color:#5b21b6; padding:10px 8px; text-align:right; font-weight:700; font-size:13px; border-bottom:2px solid #ddd6fe; word-wrap:break-word; }
+      .report-content td { padding:10px 8px; text-align:right; font-size:13px; border-bottom:1px solid #e5e7eb; word-wrap:break-word; vertical-align:top; }
       .report-content tr:last-child td { border-bottom:none; }
-      .report-content ol, .report-content ul { padding-right:0; padding-left:0; margin:14px 0; list-style:none; counter-reset:rec-counter; }
+      /* Recommendation cards */
+      .report-content ol, .report-content ul { padding-right:0; padding-left:0; margin:14px 0; list-style:none; counter-reset:rec-counter; max-width:584px; }
       .report-content ol li, .report-content ul li {
         background:#f9fafb; border-right:3px solid #8b5cf6; border-radius:6px;
-        padding:12px 16px; margin:8px 0; font-size:14px; line-height:1.7; position:relative;
+        padding:12px 16px; margin:8px 0; font-size:14px; line-height:1.7; position:relative; max-width:584px; word-wrap:break-word;
       }
       .report-content ol li { counter-increment:rec-counter; padding-right:50px; }
       .report-content ol li:before {
@@ -355,57 +357,90 @@ def send_report_email(client_email, controller_id, report_md, cycle_count, days_
       }
       .report-content hr { border:none; border-top:1px solid #e5e7eb; margin:18px 0; }
       .report-content code { background:#f3f4f6; color:#5b21b6; padding:1px 6px; border-radius:4px; font-family:monospace; font-size:13px; }
-      /* Mobile */
+      /* Mobile: shrink container + content */
       @media only screen and (max-width:600px) {
-        .report-content { font-size:14px; }
-        .report-content td, .report-content th { padding:8px; font-size:12px; }
+        .report-content { font-size:14px; max-width:100%; }
+        .report-content td, .report-content th { padding:6px 4px; font-size:12px; }
         .report-content ol li, .report-content ul li { padding:10px 12px; }
         .report-content ol li { padding-right:42px; }
       }
     </style>"""
 
-    # V25.25: Table-based layout for email-client compatibility (Outlook!).
-    # max-width on a single <table> is honored by all major clients.
+    # V25.26: Outlook-strict layout. Three-layer defense:
+    # (1) MSO conditional table forces Outlook to render at fixed 640px
+    # (2) Modern clients use a <div> with max-width:640px (Outlook ignores divs in MSO)
+    # (3) Inner content table has NO width:100% — only width="640" attribute + style width:640px
+    # CRITICAL: never set width:100% on the container table. It overrides max-width in Outlook.
     html_template = f"""<!DOCTYPE html>
 <html lang="he" dir="rtl">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="x-apple-disable-message-reformatting">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
 <title>דוח אגרונומי</title>
 {body_styles}
+<!--[if mso]>
+<style type="text/css">
+  table {{ border-collapse:collapse; }}
+  .report-content {{ font-family: Arial, sans-serif !important; }}
+</style>
+<![endif]-->
 </head>
-<body style="margin:0;padding:0;background:#f3f4f6;font-family:'Heebo','Segoe UI',Arial,sans-serif;direction:rtl;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f3f4f6;">
+<body style="margin:0;padding:0;background-color:#f3f4f6;font-family:'Heebo','Segoe UI',Arial,sans-serif;direction:rtl;">
+  <!-- Outer wrapper: full window width with background -->
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f3f4f6" style="background-color:#f3f4f6;">
     <tr>
-      <td align="center" style="padding:24px 12px;">
-        <table role="presentation" width="640" cellpadding="0" cellspacing="0" border="0" style="max-width:640px;width:100%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,0.06);">
+      <td align="center" valign="top" style="padding:24px 12px;">
 
-          <!-- Header -->
-          <tr>
-            <td style="background:#6d28d9;background-image:linear-gradient(135deg,#8b5cf6,#6d28d9);color:#ffffff;padding:26px 24px;text-align:center;">
-              <div style="font-size:22px;font-weight:700;margin-bottom:6px;">דוח אגרונומי יומי</div>
-              <div style="font-size:13px;opacity:0.92;">{friendly_name} &middot; מחזור #{cycle_count} &middot; יום {days_into_cycle}</div>
-            </td>
-          </tr>
+        <!--[if mso]>
+        <table role="presentation" align="center" width="640" cellpadding="0" cellspacing="0" border="0">
+        <tr><td align="center" valign="top" width="640" style="width:640px;">
+        <![endif]-->
 
-          {plants_html_row}
+        <!--[if !mso]><!-- -->
+        <div style="max-width:640px;margin:0 auto;">
+        <!--<![endif]-->
 
-          <!-- Content -->
-          <tr>
-            <td class="report-content" style="padding:28px 28px 24px 28px;font-family:'Heebo','Segoe UI',Arial,sans-serif;color:#1f2937;font-size:15px;line-height:1.85;text-align:right;direction:rtl;">
-              {html_body}
-            </td>
-          </tr>
+          <!-- Container: fixed 640px in Outlook (HTML attribute), max-width via parent div elsewhere -->
+          <table role="presentation" align="center" width="640" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="width:640px;max-width:640px;background-color:#ffffff;border-radius:14px;">
 
-          {chart_html}
+            <!-- Header -->
+            <tr>
+              <td bgcolor="#6d28d9" style="background-color:#6d28d9;background-image:linear-gradient(135deg,#8b5cf6,#6d28d9);color:#ffffff;padding:26px 24px;text-align:center;border-radius:14px 14px 0 0;">
+                <div style="font-size:22px;font-weight:700;margin-bottom:6px;color:#ffffff;">דוח אגרונומי יומי</div>
+                <div style="font-size:13px;color:#ffffff;opacity:0.92;">{friendly_name} &middot; מחזור #{cycle_count} &middot; יום {days_into_cycle}</div>
+              </td>
+            </tr>
 
-          <!-- Footer -->
-          <tr>
-            <td style="background:#f8fafc;padding:14px;text-align:center;font-size:11px;color:#6b7280;">
-              &copy; 2026 SmartHydro Systems
-            </td>
-          </tr>
+            {plants_html_row}
+
+            <!-- Content cell: explicit width 640 minus padding = 584 content area -->
+            <tr>
+              <td class="report-content" width="640" style="width:640px;padding:28px 28px 24px 28px;font-family:'Heebo','Segoe UI',Arial,sans-serif;color:#1f2937;font-size:15px;line-height:1.85;text-align:right;direction:rtl;word-break:break-word;">
+                {html_body}
+              </td>
+            </tr>
+
+            {chart_html}
+
+            <!-- Footer -->
+            <tr>
+              <td bgcolor="#f8fafc" style="background-color:#f8fafc;padding:14px;text-align:center;font-size:11px;color:#6b7280;border-radius:0 0 14px 14px;">
+                &copy; 2026 SmartHydro Systems
+              </td>
+            </tr>
+          </table>
+
+        <!--[if !mso]><!-- -->
+        </div>
+        <!--<![endif]-->
+
+        <!--[if mso]>
+        </td></tr>
         </table>
+        <![endif]-->
+
       </td>
     </tr>
   </table>
