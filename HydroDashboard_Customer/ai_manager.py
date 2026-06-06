@@ -174,10 +174,15 @@ def generate_report(controller_id, settings, history_entries, cycle_start_dt, cy
     cycle_str = cycle_start_dt.strftime('%d/%m/%Y') if cycle_start_dt else "לא הוגדר"
     days_into_cycle = (datetime.now().date() - cycle_start_dt.date()).days if cycle_start_dt else "?"
 
+    # V25.24: Explicit date anchor — prevents Gemini from hallucinating dates
+    today_iso = datetime.now().strftime('%Y-%m-%d')      # 2026-06-07
+    today_dmy = datetime.now().strftime('%d/%m/%Y')      # 07/06/2026
+    today_weekday_he = ['שני','שלישי','רביעי','חמישי','שישי','שבת','ראשון'][datetime.now().weekday()]
+
     today_summary = ""
     if history_entries:
         d, data = history_entries[-1]
-        today_summary = (f"היום ({d.strftime('%d/%m')}): pH={data.get('ph_avg', 0):.2f}, "
+        today_summary = (f"היום ({d.strftime('%d/%m/%Y')}): pH={data.get('ph_avg', 0):.2f}, "
                          f"EC={data.get('ec_avg', 0):.0f}, Temp={data.get('temp_avg', 0):.1f}°C")
 
     # V13.27+: מידע על הצמחים שגדלים – לדוח מותאם אישית
@@ -215,9 +220,16 @@ def generate_report(controller_id, settings, history_entries, cycle_start_dt, cy
 5. **כיוון לאופטימיזציה** – איך לשפר עוד 10-15% תפוקה
 6. שפה מקצועית אגרונומית, בלי "אולי" ו"כדאי" – אמירה ברורה."""
 
-    prompt = f"""אתה אגרונום מומחה למערכות הידרופוניקה. הפק דוח לגינה הבאה:
+    prompt = f"""אתה אגרונום מומחה למערכות הידרופוניקה. הפק דוח לגינה הבאה.
 
-מחזור גידול נוכחי #{cycle_count}, החל ב-{cycle_str} (יום {days_into_cycle} למחזור).
+=== עיגון תאריך (חובה לדבוק בו!) ===
+התאריך היום: {today_dmy} (יום {today_weekday_he}, {today_iso})
+זה היום עבורו מופק הדוח. אל תכתוב תאריך אחר. אל תמציא תאריכים.
+כל אזכור של "היום" או "כעת" חייב להתייחס ל-{today_dmy}.
+
+=== נתוני המחזור ===
+מחזור גידול #{cycle_count}, החל ב-{cycle_str}, יום {days_into_cycle} למחזור.
+(אל תחשב מחדש את מספר הימים — השתמש בערך {days_into_cycle} שניתן לך כאן.)
 {plants_section}
 יעדי הגידול:
 - טמפרטורה: {targets.get('temp_min')}–{targets.get('temp_max')} °C
@@ -231,20 +243,25 @@ def generate_report(controller_id, settings, history_entries, cycle_start_dt, cy
 
 {style_instructions}
 
-הנחיות כלליות (תקפות לכל סגנון):
+=== הנחיות כלליות ===
 - **התחל ישר במהות** – בלי "שלום למגדל היקר".
 - **אל תזכיר MAC address**.
 - **תייחס לצמחים** אם הוגדרו.
 - אם רוב הקריאות 0 או חסרות (מחזור צעיר <3 ימים) – ציין שזה תקין ולא תקלה.
+- **התאריך היום הוא {today_dmy}** — אל תכתוב תאריך אחר בכותרת או בגוף.
+- **מספר הימים במחזור הוא {days_into_cycle}** — אל תחשב מחדש.
 
-החזר אך ורק את תוכן הדוח בפורמט Markdown בעברית. השתמש בכותרות ## ובהדגשות **."""
+החזר אך ורק את תוכן הדוח בפורמט Markdown בעברית. השתמש בכותרות ## ובהדגשות **.
+**טבלאות**: השתמש בפורמט Markdown סטנדרטי עם |---| בין הכותרת לשורות."""
 
     response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
     return response.text
 
 
 def send_report_email(client_email, controller_id, report_md, cycle_count, days_into_cycle, chart_url=None, plants_text=None, device_name=None):
-    html_body = markdown.markdown(report_md)
+    # V25.24: extensions=['tables','nl2br'] — renders Markdown pipe-tables as real <table>
+    # and converts single newlines to <br> for better paragraph spacing.
+    html_body = markdown.markdown(report_md, extensions=['tables', 'nl2br'])
     friendly_name = device_name if device_name else "SmartHydro"
     plants_html = ""
     if plants_text:
@@ -266,20 +283,36 @@ def send_report_email(client_email, controller_id, report_md, cycle_count, days_
         <div style="padding: 15px; background: #fafafa; border-top: 1px solid #eee; text-align: center; color: #9ca3af; font-size: 12px;">
             📊 גרף הצריכה יופיע כשיצטברו נתונים יומיים (החל מהיום השני במחזור).
         </div>"""
+    # V25.24: inline CSS for clean tables + readable text inside the body
+    body_styles = """
+    <style>
+        .report-body { font-family: 'Heebo', sans-serif; color: #1f2937; line-height: 1.6; font-size: 14px; }
+        .report-body h2 { color: #6d28d9; border-bottom: 2px solid #ede9fe; padding-bottom: 6px; margin-top: 20px; font-size: 18px; }
+        .report-body h3 { color: #374151; margin-top: 16px; font-size: 15px; }
+        .report-body p { margin: 8px 0; }
+        .report-body strong { color: #6d28d9; }
+        .report-body table { border-collapse: collapse; width: 100%; margin: 12px 0; background: #fafafa; border-radius: 8px; overflow: hidden; }
+        .report-body th { background: #ede9fe; color: #5b21b6; padding: 10px; text-align: right; font-weight: bold; border-bottom: 2px solid #ddd6fe; }
+        .report-body td { padding: 10px; text-align: right; border-bottom: 1px solid #e5e7eb; }
+        .report-body tr:last-child td { border-bottom: none; }
+        .report-body ul, .report-body ol { padding-right: 22px; padding-left: 0; }
+        .report-body li { margin: 6px 0; }
+        .report-body hr { border: none; border-top: 1px solid #e5e7eb; margin: 16px 0; }
+    </style>"""
     html_template = f"""
 <!DOCTYPE html>
 <html lang="he" dir="rtl">
-<head><meta charset="UTF-8"></head>
-<body style="font-family: sans-serif; direction: rtl; text-align: right; padding: 20px;">
-    <div style="max-width: 600px; margin: 0 auto; border: 1px solid #ddd; border-radius: 10px; overflow: hidden;">
-        <div style="background: #8b5cf6; color: white; padding: 20px; text-align: center;">
-            <h1 style="margin: 0;">דוח אגרונומי יומי</h1>
-            <p style="margin: 5px 0 0 0;">{friendly_name} | מחזור #{cycle_count} | יום {days_into_cycle}</p>
+<head><meta charset="UTF-8">{body_styles}</head>
+<body style="font-family: 'Heebo', sans-serif; direction: rtl; text-align: right; padding: 20px; background: #f3f4f6;">
+    <div style="max-width: 640px; margin: 0 auto; background: white; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden;">
+        <div style="background: linear-gradient(135deg, #8b5cf6, #6d28d9); color: white; padding: 22px; text-align: center;">
+            <h1 style="margin: 0; font-size: 22px;">דוח אגרונומי יומי</h1>
+            <p style="margin: 8px 0 0 0; opacity: 0.92; font-size: 13px;">{friendly_name} · מחזור #{cycle_count} · יום {days_into_cycle}</p>
         </div>
         {plants_html}
-        <div style="padding: 20px;">{html_body}</div>
+        <div class="report-body" style="padding: 22px;">{html_body}</div>
         {chart_html}
-        <div style="background: #f8fafc; padding: 10px; text-align: center; font-size: 12px;">
+        <div style="background: #f8fafc; padding: 12px; text-align: center; font-size: 11px; color: #6b7280;">
             &copy; 2026 SmartHydro Systems
         </div>
     </div>
