@@ -57,36 +57,88 @@ def format_plants_for_prompt(plants_list):
     return ", ".join(parts)
 
 
-def build_consumption_chart_url(history_entries):
-    """בונה URL ל-QuickChart.io עם גרף צריכה יומית של pH ו-EC (שניות).
-    מקסימום 30 ימים אחרונים.
+def build_consumption_chart_url(history_entries, targets=None):
+    """V25.26: REPLACED bar chart with a trend line chart.
+    Old: stacked bars of acid/nutrient consumption per day — mostly empty bars,
+         a single spike dominated, useless visualization.
+    New: line chart of pH and EC over time with target range bands.
+         Customer instantly sees stability/drift relative to targets.
+
+    Two Y axes: pH on the right (~5-7), EC on the left (~0-3000).
+    Up to 30 most recent days. Returns None if no history.
     """
     if not history_entries:
         return None
     recent = history_entries[-30:]
     labels = [d.strftime('%d/%m') for d, _ in recent]
-    ph_data = [int(data.get('ph_sec_total', 0) or 0) for _, data in recent]
-    ec_data = [int(data.get('ec_sec_total', 0) or 0) for _, data in recent]
+    ph_data = [round(float(data.get('ph_avg', 0) or 0), 2) for _, data in recent]
+    ec_data = [int(data.get('ec_avg', 0) or 0) for _, data in recent]
 
-    # מציגים גרף גם עם כל הערכים 0, כל עוד יש לפחות יום אחד של נתונים
+    # Targets — show as dashed reference lines (optional)
+    targets = targets or {}
+    ph_min = targets.get('ph_min')
+    ph_max = targets.get('ph_max')
+    ec_min = targets.get('ec_min')
+    ec_max = targets.get('ec_max')
+
+    datasets = [
+        {
+            "label": "pH", "data": ph_data, "borderColor": "#3b82f6",
+            "backgroundColor": "rgba(59,130,246,0.08)", "borderWidth": 3,
+            "pointRadius": 3, "pointBackgroundColor": "#3b82f6",
+            "yAxisID": "yPh", "fill": False, "tension": 0.3
+        },
+        {
+            "label": "EC (µS)", "data": ec_data, "borderColor": "#10b981",
+            "backgroundColor": "rgba(16,185,129,0.08)", "borderWidth": 3,
+            "pointRadius": 3, "pointBackgroundColor": "#10b981",
+            "yAxisID": "yEc", "fill": False, "tension": 0.3
+        }
+    ]
+
+    # Add target range bands as faint dashed lines if available
+    if ph_min is not None and ph_max is not None:
+        datasets.append({
+            "label": f"יעד pH ({ph_min}-{ph_max})", "data": [ph_max] * len(labels),
+            "borderColor": "rgba(59,130,246,0.35)", "borderDash": [4, 4],
+            "borderWidth": 1, "pointRadius": 0, "yAxisID": "yPh", "fill": False
+        })
+        datasets.append({
+            "label": "", "data": [ph_min] * len(labels),
+            "borderColor": "rgba(59,130,246,0.35)", "borderDash": [4, 4],
+            "borderWidth": 1, "pointRadius": 0, "yAxisID": "yPh", "fill": False
+        })
+    if ec_min is not None and ec_max is not None:
+        datasets.append({
+            "label": f"יעד EC ({ec_min}-{ec_max})", "data": [ec_max] * len(labels),
+            "borderColor": "rgba(16,185,129,0.35)", "borderDash": [4, 4],
+            "borderWidth": 1, "pointRadius": 0, "yAxisID": "yEc", "fill": False
+        })
+        datasets.append({
+            "label": "", "data": [ec_min] * len(labels),
+            "borderColor": "rgba(16,185,129,0.35)", "borderDash": [4, 4],
+            "borderWidth": 1, "pointRadius": 0, "yAxisID": "yEc", "fill": False
+        })
 
     chart_config = {
-        "type": "bar",
-        "data": {
-            "labels": labels,
-            "datasets": [
-                {"label": "חומצה (pH) – שניות", "backgroundColor": "#3b82f6", "data": ph_data},
-                {"label": "דשן (EC) – שניות", "backgroundColor": "#10b981", "data": ec_data}
-            ]
-        },
+        "type": "line",
+        "data": {"labels": labels, "datasets": datasets},
         "options": {
-            "title": {"display": True, "text": "צריכה יומית במחזור הנוכחי", "fontSize": 16},
-            "legend": {"position": "bottom"},
-            "scales": {"yAxes": [{"ticks": {"beginAtZero": True}, "scaleLabel": {"display": True, "labelString": "שניות הפעלה"}}]}
+            "title": {"display": True, "text": "מגמת pH ו-EC לאורך המחזור", "fontSize": 16},
+            "legend": {"position": "bottom", "labels": {"filter": "function(item){return item.text!=='';}"}},
+            "scales": {
+                "yAxes": [
+                    {"id": "yPh", "position": "right", "scaleLabel": {"display": True, "labelString": "pH"},
+                     "ticks": {"min": 4, "max": 8, "stepSize": 0.5}, "gridLines": {"drawOnChartArea": False}},
+                    {"id": "yEc", "position": "left", "scaleLabel": {"display": True, "labelString": "EC (µS)"},
+                     "ticks": {"min": 0, "stepSize": 500}}
+                ],
+                "xAxes": [{"scaleLabel": {"display": True, "labelString": "תאריך"}}]
+            }
         }
     }
     encoded = urllib.parse.quote(json.dumps(chart_config, ensure_ascii=False))
-    return f"https://quickchart.io/chart?c={encoded}&w=600&h=350&bkg=white"
+    return f"https://quickchart.io/chart?c={encoded}&w=640&h=360&bkg=white"
 
 # --- משתני סביבה (GitHub Actions secrets) ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -196,64 +248,44 @@ def generate_report(controller_id, settings, history_entries, cycle_start_dt, cy
     total_ec_sec = sum(int(d.get('ec_sec_total', 0) or 0) for _, d in history_entries)
     consumption_text = f"\nצריכת חומרים מצטברת במחזור: חומצה pH – {total_ph_sec} שניות, דשן EC – {total_ec_sec} שניות.\n"
 
-    # PWA v25: הנחיות שונות לפי סגנון הדוח שהמשתמש בחר
+    # V25.26: simplified to 2 styles — 'brief' (default) and 'agronomist' (PRO+).
+    # 'detailed' was removed: it caused walls of text + overlapped agronomist.
+    # Legacy 'detailed' preference falls through to 'agronomist'.
     if report_style == 'brief':
-        style_instructions = """**סגנון: תקציר קצר ועניינו** (5-7 שורות, רק עיקרי + התראות).
-1. כותרת ## עם סטטוס היום (תקין/חורג/לא יציב)
-2. שורה אחת על pH, שורה אחת על EC, שורה אחת על טמפרטורה
-3. **התראות בלבד** – לא תיאוריות. אם הכל תקין: "✓ הכל בטווח, אין מה לעשות".
-4. **בלי המלצות מפורטות** – רק "מומלץ לבדוק X" אם יש בעיה אמיתית.
-5. עד 7 שורות סה"כ. בלי טבלאות, בלי גרפים."""
-    elif report_style == 'detailed':
-        style_instructions = """**סגנון: דוח מפורט** (טבלאות, ניתוח מגמות, גרפים).
-1. כותרת ## עם סטטוס היום
-2. **טבלה** של 3 העמודות (pH, EC, Temp) - היום, אתמול, ממוצע מחזור, יעד
-3. ניתוח מגמות מצטבר - יציבות לעומת אתמול, מגמה לאורך המחזור
-4. הסבר הסיבות לחריגות (אם יש)
-5. סיכום צריכת חומרים + צפי לסוף השבוע
-6. המלצות מפורטות עם נימוקים"""
-    else:  # agronomist
-        style_instructions = """**סגנון: אגרונום AI מקצועי** – לקוחות PRO+, המלצות פעולה ותובנות.
-1. **דיאגנוזה אגרונומית** של מצב הצמחים לפי כל הנתונים יחד
-2. **תובנות מיקרו** – צירופי תופעות שמשתמש רגיל לא יזהה (לדוגמה: "EC יורד עם עליית טמפ' = שורשים פעילים, צריכת מים מואצת")
-3. **המלצות פעולה ספציפיות לשבוע הקרוב** – לא כללי, אלא: "ביום שלישי בערב הוסף 50ml דשן" / "צמצם תאורה ב-2 שעות"
-4. **תחזית בעיות פוטנציאליות** ב-3-5 ימים הקרובים בהתבסס על מגמות
-5. **כיוון לאופטימיזציה** – איך לשפר עוד 10-15% תפוקה
-6. שפה מקצועית אגרונומית, בלי "אולי" ו"כדאי" – אמירה ברורה."""
+        style_instructions = """**סגנון: תקציר יומי (5-7 שורות).**
+מבנה:
+- שורה 1: כותרת ## עם סטטוס היום במשפט אחד (✓ הכל תקין / ⚠ pH חורג / וכו').
+- שורות 2-4: שורה לכל מדד (pH, EC, טמפ׳) — ערך + סטטוס בלבד.
+- שורות 5-7: התראה ופעולה — רק אם יש בעיה אמיתית. אם הכל תקין כתוב "אין מה לעשות היום".
+ללא טבלאות, ללא רשימות ארוכות."""
+    else:  # 'agronomist' (PRO+) — also catches legacy 'detailed'
+        style_instructions = """**סגנון: דוח אגרונומי מלא (PRO+).**
+מבנה (3 חלקים בלבד, סך הכל עד 25 שורות):
+1. **טבלת מצב** — שורה לכל מדד: היום | אתמול | ממוצע מחזור | יעד | סטטוס.
+2. **ניתוח קצר** — 2-3 משפטים על המגמה לאורך המחזור (לא להעתיק נתונים — להסיק).
+3. **המלצות פעולה** — עד 3 פריטים ממוספרים, כל אחד ב-2 שורות מקסימום:
+   נימוק (1 משפט) + פעולה ספציפית (1 משפט).
+חובה: ללא חזרות. ללא תיאור היסטוריה ארוכה. ללא הסברים תיאורטיים."""
 
-    prompt = f"""אתה אגרונום מומחה למערכות הידרופוניקה. הפק דוח לגינה הבאה.
+    prompt = f"""אתה אגרונום מומחה למערכות הידרופוניקה. הפק דוח קצר ומדויק.
 
-=== עיגון תאריך (חובה לדבוק בו!) ===
-התאריך היום: {today_dmy} (יום {today_weekday_he}, {today_iso})
-זה היום עבורו מופק הדוח. אל תכתוב תאריך אחר. אל תמציא תאריכים.
-כל אזכור של "היום" או "כעת" חייב להתייחס ל-{today_dmy}.
-
-=== נתוני המחזור ===
-מחזור גידול #{cycle_count}, החל ב-{cycle_str}, יום {days_into_cycle} למחזור.
-(אל תחשב מחדש את מספר הימים — השתמש בערך {days_into_cycle} שניתן לך כאן.)
+תאריך היום: {today_dmy} ({today_weekday_he}). אל תכתוב תאריך אחר.
+מחזור #{cycle_count}, יום {days_into_cycle} (החל {cycle_str}). אל תחשב מחדש.
 {plants_section}
-יעדי הגידול:
-- טמפרטורה: {targets.get('temp_min')}–{targets.get('temp_max')} °C
-- pH: {targets.get('ph_min')}–{targets.get('ph_max')}
-- EC: {targets.get('ec_min')}–{targets.get('ec_max')} µS
+יעדים: pH {targets.get('ph_min')}-{targets.get('ph_max')} | EC {targets.get('ec_min')}-{targets.get('ec_max')} µS | טמפ׳ {targets.get('temp_min')}-{targets.get('temp_max')} °C
 
 {today_summary}
 {consumption_text}
-היסטוריה יומית מאז תחילת המחזור:
+היסטוריה:
 {format_history_for_prompt(history_entries)}
 
 {style_instructions}
 
-=== הנחיות כלליות ===
-- **התחל ישר במהות** – בלי "שלום למגדל היקר".
-- **אל תזכיר MAC address**.
-- **תייחס לצמחים** אם הוגדרו.
-- אם רוב הקריאות 0 או חסרות (מחזור צעיר <3 ימים) – ציין שזה תקין ולא תקלה.
-- **התאריך היום הוא {today_dmy}** — אל תכתוב תאריך אחר בכותרת או בגוף.
-- **מספר הימים במחזור הוא {days_into_cycle}** — אל תחשב מחדש.
-
-החזר אך ורק את תוכן הדוח בפורמט Markdown בעברית. השתמש בכותרות ## ובהדגשות **.
-**טבלאות**: השתמש בפורמט Markdown סטנדרטי עם |---| בין הכותרת לשורות."""
+חוקים:
+- התחל ישר במהות, ללא ברכות.
+- מספר הימים = {days_into_cycle}. התאריך = {today_dmy}. ללא המצאות.
+- אם מחזור צעיר (פחות מ-3 ימים) — ציין שאין מספיק נתונים לניתוח.
+- Markdown בעברית, כותרות ## והדגשות **. טבלאות בפורמט |---|."""
 
     response = _gemini_generate_with_retry(prompt)
     return response.text
@@ -303,16 +335,16 @@ def send_report_email(client_email, controller_id, report_md, cycle_count, days_
         chart_html = f"""
         <tr>
           <td style="padding:24px 20px;background:#fafafa;border-top:1px solid #e5e7eb;text-align:center;">
-            <div style="font-size:14px;font-weight:bold;color:#374151;margin-bottom:12px;">📊 גרף צריכת חומרים – כל יום במחזור</div>
-            <img src="{chart_url}" alt="צריכת חומרים יומית" style="max-width:100%;height:auto;border:1px solid #e5e7eb;border-radius:8px;display:block;margin:0 auto;">
-            <div style="font-size:11px;color:#6b7280;margin-top:10px;line-height:1.5;">כל עמודה = יום אחד במחזור. שניות הפעלה של משאבת חומצה (כחול) ודשן (ירוק).</div>
+            <div style="font-size:14px;font-weight:bold;color:#374151;margin-bottom:12px;">📈 מגמת pH ו-EC לאורך המחזור</div>
+            <img src="{chart_url}" alt="גרף מגמת pH ו-EC" style="max-width:100%;height:auto;border:1px solid #e5e7eb;border-radius:8px;display:block;margin:0 auto;">
+            <div style="font-size:11px;color:#6b7280;margin-top:10px;line-height:1.5;">קווים מלאים: ערך יומי בפועל. קווים מקווקווים: גבולות היעד.</div>
           </td>
         </tr>"""
     else:
         chart_html = """
         <tr>
           <td style="padding:16px;background:#fafafa;border-top:1px solid #e5e7eb;text-align:center;color:#9ca3af;font-size:12px;">
-            📊 גרף הצריכה יופיע כשיצטברו נתונים יומיים (החל מהיום השני במחזור).
+            📈 גרף מגמה יופיע כשיצטברו נתונים יומיים (החל מהיום השני במחזור).
           </td>
         </tr>"""
 
@@ -608,7 +640,14 @@ def process_all_controllers():
         # 8. שליחת email – עם גרף צריכה ומידע על צמחים
         try:
             days_into_cycle = (datetime.now().date() - cycle_start_dt.date()).days if cycle_start_dt else 0
-            chart_url = build_consumption_chart_url(history)
+            settings_for_chart = data.get('settings', {}) if isinstance(data.get('settings'), dict) else {}
+            chart_targets = {
+                'ph_min': settings_for_chart.get('ph_min'),
+                'ph_max': settings_for_chart.get('ph_max'),
+                'ec_min': settings_for_chart.get('ec_min'),
+                'ec_max': settings_for_chart.get('ec_max'),
+            }
+            chart_url = build_consumption_chart_url(history, targets=chart_targets)
             plants_text = format_plants_for_prompt(settings.get('plants', []) if isinstance(settings, dict) else [])
             send_report_email(owner_email, controller_id, report_md, cycle_count, days_into_cycle,
                               chart_url=chart_url, plants_text=plants_text, device_name=device_name)
