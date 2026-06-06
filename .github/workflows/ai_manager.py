@@ -367,7 +367,36 @@ def _gemini_generate_with_retry(prompt, model='gemini-2.5-flash', max_attempts=3
     raise last_exc if last_exc else RuntimeError("Retry loop exited unexpectedly")
 
 
+def _add_sentence_breaks(md_text):
+    """V25.27: insert a Markdown line break (two spaces + \\n) after every period or colon
+    that ends a sentence in a paragraph. Skips lines that are tables, lists, or headings.
+    Effect: when rendered, each sentence sits on its own line — no long walls of text.
+    """
+    import re
+    out_lines = []
+    for line in md_text.split('\n'):
+        stripped = line.lstrip()
+        # Skip non-paragraph lines (tables, headings, list items, blank)
+        if (not stripped or stripped.startswith('|') or stripped.startswith('#') or
+                stripped.startswith('- ') or stripped.startswith('* ') or
+                re.match(r'^\d+\.\s', stripped) or
+                re.match(r'^\s*\|', line)):
+            out_lines.append(line)
+            continue
+        # Insert "  \n" after period/colon followed by space + Hebrew/Latin letter
+        # Avoid breaking inside numbers (e.g. 1.5, 25.23) — the lookbehind excludes digits
+        line = re.sub(
+            r'(?<=[א-תa-zA-Z\)\]])([\.\:])\s+(?=[א-תA-Z])',
+            r'\1  \n',
+            line
+        )
+        out_lines.append(line)
+    return '\n'.join(out_lines)
+
+
 def send_report_email(client_email, controller_id, report_md, cycle_count, days_into_cycle, chart_url=None, plants_text=None, device_name=None):
+    # V25.27: break long paragraphs into sentence-per-line BEFORE rendering Markdown
+    report_md = _add_sentence_breaks(report_md)
     # V25.24: extensions=['tables','nl2br'] — renders Markdown pipe-tables as real <table>
     # and converts single newlines to <br> for better paragraph spacing.
     html_body = markdown.markdown(report_md, extensions=['tables', 'nl2br'])
@@ -377,148 +406,102 @@ def send_report_email(client_email, controller_id, report_md, cycle_count, days_
     if chart_url:
         chart_html = f"""
         <tr>
-          <td style="padding:24px 20px;background:#fafafa;border-top:1px solid #e5e7eb;text-align:center;">
-            <div style="font-size:14px;font-weight:bold;color:#374151;margin-bottom:12px;">📈 מגמת pH ו-EC לאורך המחזור</div>
-            <img src="{chart_url}" alt="גרף מגמת pH ו-EC" style="max-width:100%;height:auto;border:1px solid #e5e7eb;border-radius:8px;display:block;margin:0 auto;">
-            <div style="font-size:11px;color:#6b7280;margin-top:10px;line-height:1.5;">קווים מלאים: ערך יומי בפועל. קווים מקווקווים: גבולות היעד.</div>
+          <td width="640" style="width:640px;padding:20px 24px;background-color:#fafafa;border-top:1px solid #e5e7eb;text-align:center;">
+            <div style="font-size:13px;font-weight:bold;color:#374151;margin-bottom:10px;">📈 מגמת pH ו-EC לאורך המחזור</div>
+            <img src="{chart_url}" alt="גרף מגמה" width="592" style="width:592px;max-width:592px;height:auto;border:1px solid #e5e7eb;border-radius:8px;display:block;margin:0 auto;">
+            <div style="font-size:10px;color:#6b7280;margin-top:8px;line-height:1.5;">קווים מלאים: ערך יומי. קווים מקווקווים: גבולות היעד.</div>
           </td>
         </tr>"""
     else:
         chart_html = """
         <tr>
-          <td style="padding:16px;background:#fafafa;border-top:1px solid #e5e7eb;text-align:center;color:#9ca3af;font-size:12px;">
-            📈 גרף מגמה יופיע כשיצטברו נתונים יומיים (החל מהיום השני במחזור).
+          <td width="640" style="width:640px;padding:14px;background-color:#fafafa;border-top:1px solid #e5e7eb;text-align:center;color:#9ca3af;font-size:11px;">
+            📈 גרף מגמה יופיע כשיצטברו נתונים יומיים.
           </td>
         </tr>"""
 
-    # V25.25: plants_html wrapped as table row for email-safe layout
+    # V25.27: plants row at locked 640px width
     plants_html_row = ""
     if plants_text:
         plants_html_row = f"""
         <tr>
-          <td style="background:#f0fdf4;padding:12px 20px;border-bottom:1px solid #bbf7d0;text-align:right;font-size:13px;">
+          <td width="640" bgcolor="#f0fdf4" style="width:640px;background-color:#f0fdf4;padding:10px 24px;border-bottom:1px solid #bbf7d0;text-align:right;font-size:12px;">
             <span style="color:#15803d;font-weight:bold;">🌱 גידול נוכחי:</span>
             <span style="color:#166534;"> {plants_text}</span>
           </td>
         </tr>"""
 
-    # V25.26: Email-client CSS. Inner tables MUST use table-layout:fixed +
-    # width:100% so long text doesn't push them past 584px (640 - 56 padding).
+    # V25.27: HARD-LOCKED 640px width. Every element gets explicit width.
+    # No percentages, no max-width on container, no responsive behavior.
+    # If user opens on mobile they'll see horizontal scroll — acceptable tradeoff
+    # for guaranteed Outlook desktop behavior.
     body_styles = """
     <style>
-      /* Gmail/web client typography */
-      .report-content { font-family: 'Heebo','Segoe UI',Arial,sans-serif; color:#1f2937; font-size:15px; line-height:1.85; max-width:584px; }
-      .report-content h2 { color:#6d28d9; font-size:18px; font-weight:700; margin:24px 0 10px 0; padding-bottom:6px; border-bottom:2px solid #ede9fe; }
-      .report-content h3 { color:#374151; font-size:15px; font-weight:700; margin:18px 0 8px 0; }
-      .report-content p { margin:10px 0; max-width:584px; word-wrap:break-word; }
+      .report-content { font-family: 'Heebo','Segoe UI',Arial,sans-serif; color:#1f2937; font-size:14px; line-height:1.7; }
+      .report-content h2 { color:#6d28d9; font-size:17px; font-weight:700; margin:20px 0 8px 0; padding-bottom:5px; border-bottom:2px solid #ede9fe; }
+      .report-content h3 { color:#374151; font-size:14px; font-weight:700; margin:14px 0 6px 0; }
+      .report-content p { margin:6px 0; }
       .report-content strong { color:#5b21b6; font-weight:700; }
-      .report-content em { color:#6b7280; font-style:normal; font-size:13px; }
-      /* Inner tables from Markdown — constrain to content width */
-      .report-content table { border-collapse:collapse; width:100% !important; max-width:584px; margin:14px 0; background:#fafafa; border-radius:8px; table-layout:fixed; }
-      .report-content th { background:#ede9fe; color:#5b21b6; padding:10px 8px; text-align:right; font-weight:700; font-size:13px; border-bottom:2px solid #ddd6fe; word-wrap:break-word; }
-      .report-content td { padding:10px 8px; text-align:right; font-size:13px; border-bottom:1px solid #e5e7eb; word-wrap:break-word; vertical-align:top; }
+      .report-content em { color:#6b7280; font-style:normal; font-size:12px; }
+      .report-content table { border-collapse:collapse; width:584px; max-width:584px; margin:10px 0; background:#fafafa; border-radius:8px; table-layout:fixed; }
+      .report-content th { background:#ede9fe; color:#5b21b6; padding:8px 6px; text-align:right; font-weight:700; font-size:12px; border-bottom:2px solid #ddd6fe; word-wrap:break-word; }
+      .report-content td { padding:8px 6px; text-align:right; font-size:12px; border-bottom:1px solid #e5e7eb; word-wrap:break-word; vertical-align:top; }
       .report-content tr:last-child td { border-bottom:none; }
-      /* Recommendation cards */
-      .report-content ol, .report-content ul { padding-right:0; padding-left:0; margin:14px 0; list-style:none; counter-reset:rec-counter; max-width:584px; }
+      .report-content ol, .report-content ul { padding-right:0; padding-left:0; margin:10px 0; list-style:none; counter-reset:rec-counter; }
       .report-content ol li, .report-content ul li {
         background:#f9fafb; border-right:3px solid #8b5cf6; border-radius:6px;
-        padding:12px 16px; margin:8px 0; font-size:14px; line-height:1.7; position:relative; max-width:584px; word-wrap:break-word;
+        padding:10px 14px; margin:6px 0; font-size:13px; line-height:1.6; position:relative; word-wrap:break-word;
       }
-      .report-content ol li { counter-increment:rec-counter; padding-right:50px; }
+      .report-content ol li { counter-increment:rec-counter; padding-right:44px; }
       .report-content ol li:before {
-        content:counter(rec-counter); position:absolute; right:14px; top:12px;
-        background:#8b5cf6; color:#fff; width:24px; height:24px; border-radius:50%;
-        text-align:center; line-height:24px; font-size:13px; font-weight:700;
+        content:counter(rec-counter); position:absolute; right:12px; top:10px;
+        background:#8b5cf6; color:#fff; width:22px; height:22px; border-radius:50%;
+        text-align:center; line-height:22px; font-size:12px; font-weight:700;
       }
-      .report-content hr { border:none; border-top:1px solid #e5e7eb; margin:18px 0; }
-      .report-content code { background:#f3f4f6; color:#5b21b6; padding:1px 6px; border-radius:4px; font-family:monospace; font-size:13px; }
-      /* Mobile: shrink container + content */
-      @media only screen and (max-width:600px) {
-        .report-content { font-size:14px; max-width:100%; }
-        .report-content td, .report-content th { padding:6px 4px; font-size:12px; }
-        .report-content ol li, .report-content ul li { padding:10px 12px; }
-        .report-content ol li { padding-right:42px; }
-      }
+      .report-content hr { border:none; border-top:1px solid #e5e7eb; margin:14px 0; }
+      .report-content code { background:#f3f4f6; color:#5b21b6; padding:1px 5px; border-radius:4px; font-family:monospace; font-size:12px; }
     </style>"""
 
-    # V25.26: Outlook-strict layout. Three-layer defense:
-    # (1) MSO conditional table forces Outlook to render at fixed 640px
-    # (2) Modern clients use a <div> with max-width:640px (Outlook ignores divs in MSO)
-    # (3) Inner content table has NO width:100% — only width="640" attribute + style width:640px
-    # CRITICAL: never set width:100% on the container table. It overrides max-width in Outlook.
+    # V25.27: Single 640px-wide table, centered via margin auto. No outer 100% wrapper.
+    # This is the Mailchimp-style minimal frame that Outlook ALWAYS respects.
     html_template = f"""<!DOCTYPE html>
 <html lang="he" dir="rtl">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="x-apple-disable-message-reformatting">
-<meta http-equiv="X-UA-Compatible" content="IE=edge">
 <title>דוח אגרונומי</title>
 {body_styles}
-<!--[if mso]>
-<style type="text/css">
-  table {{ border-collapse:collapse; }}
-  .report-content {{ font-family: Arial, sans-serif !important; }}
-</style>
-<![endif]-->
 </head>
-<body style="margin:0;padding:0;background-color:#f3f4f6;font-family:'Heebo','Segoe UI',Arial,sans-serif;direction:rtl;">
-  <!-- Outer wrapper: full window width with background -->
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f3f4f6" style="background-color:#f3f4f6;">
+<body style="margin:0;padding:20px 0;background-color:#f3f4f6;font-family:'Heebo','Segoe UI',Arial,sans-serif;direction:rtl;">
+
+  <table align="center" cellpadding="0" cellspacing="0" border="0" width="640" style="width:640px;margin:0 auto;background-color:#ffffff;border:1px solid #d1d5db;border-radius:14px;border-collapse:separate;">
+
+    <!-- Header -->
     <tr>
-      <td align="center" valign="top" style="padding:24px 12px;">
+      <td width="640" bgcolor="#6d28d9" style="width:640px;background-color:#6d28d9;background-image:linear-gradient(135deg,#8b5cf6,#6d28d9);color:#ffffff;padding:24px;text-align:center;border-radius:14px 14px 0 0;">
+        <div style="font-size:21px;font-weight:700;margin-bottom:4px;color:#ffffff;">דוח אגרונומי יומי</div>
+        <div style="font-size:12px;color:#ffffff;opacity:0.95;">{friendly_name} &middot; מחזור #{cycle_count} &middot; יום {days_into_cycle}</div>
+      </td>
+    </tr>
 
-        <!--[if mso]>
-        <table role="presentation" align="center" width="640" cellpadding="0" cellspacing="0" border="0">
-        <tr><td align="center" valign="top" width="640" style="width:640px;">
-        <![endif]-->
+    {plants_html_row}
 
-        <!--[if !mso]><!-- -->
-        <div style="max-width:640px;margin:0 auto;">
-        <!--<![endif]-->
+    <!-- Content cell — hard 640 minus 48 padding = 592 content area -->
+    <tr>
+      <td class="report-content" width="640" style="width:640px;padding:22px 24px;font-family:'Heebo','Segoe UI',Arial,sans-serif;color:#1f2937;font-size:14px;line-height:1.7;text-align:right;direction:rtl;word-break:break-word;">
+        {html_body}
+      </td>
+    </tr>
 
-          <!-- Container: fixed 640px in Outlook (HTML attribute), max-width via parent div elsewhere -->
-          <table role="presentation" align="center" width="640" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="width:640px;max-width:640px;background-color:#ffffff;border-radius:14px;">
+    {chart_html}
 
-            <!-- Header -->
-            <tr>
-              <td bgcolor="#6d28d9" style="background-color:#6d28d9;background-image:linear-gradient(135deg,#8b5cf6,#6d28d9);color:#ffffff;padding:26px 24px;text-align:center;border-radius:14px 14px 0 0;">
-                <div style="font-size:22px;font-weight:700;margin-bottom:6px;color:#ffffff;">דוח אגרונומי יומי</div>
-                <div style="font-size:13px;color:#ffffff;opacity:0.92;">{friendly_name} &middot; מחזור #{cycle_count} &middot; יום {days_into_cycle}</div>
-              </td>
-            </tr>
-
-            {plants_html_row}
-
-            <!-- Content cell: explicit width 640 minus padding = 584 content area -->
-            <tr>
-              <td class="report-content" width="640" style="width:640px;padding:28px 28px 24px 28px;font-family:'Heebo','Segoe UI',Arial,sans-serif;color:#1f2937;font-size:15px;line-height:1.85;text-align:right;direction:rtl;word-break:break-word;">
-                {html_body}
-              </td>
-            </tr>
-
-            {chart_html}
-
-            <!-- Footer -->
-            <tr>
-              <td bgcolor="#f8fafc" style="background-color:#f8fafc;padding:14px;text-align:center;font-size:11px;color:#6b7280;border-radius:0 0 14px 14px;">
-                &copy; 2026 SmartHydro Systems
-              </td>
-            </tr>
-          </table>
-
-        <!--[if !mso]><!-- -->
-        </div>
-        <!--<![endif]-->
-
-        <!--[if mso]>
-        </td></tr>
-        </table>
-        <![endif]-->
-
+    <!-- Footer -->
+    <tr>
+      <td width="640" bgcolor="#f8fafc" style="width:640px;background-color:#f8fafc;padding:12px;text-align:center;font-size:10px;color:#6b7280;border-radius:0 0 14px 14px;">
+        &copy; 2026 SmartHydro Systems
       </td>
     </tr>
   </table>
+
 </body>
 </html>"""
     msg = MIMEMultipart('alternative')
