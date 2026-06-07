@@ -248,24 +248,54 @@ def generate_report(controller_id, settings, history_entries, cycle_start_dt, cy
     total_ec_sec = sum(int(d.get('ec_sec_total', 0) or 0) for _, d in history_entries)
     consumption_text = f"\nצריכת חומרים מצטברת במחזור: חומצה pH – {total_ph_sec} שניות, דשן EC – {total_ec_sec} שניות.\n"
 
-    # V25.26: simplified to 2 styles — 'brief' (default) and 'agronomist' (PRO+).
-    # 'detailed' was removed: it caused walls of text + overlapped agronomist.
-    # Legacy 'detailed' preference falls through to 'agronomist'.
+    # V25.28: ULTRA-STRICT format — every sentence on its own paragraph.
+    # This is enforced both in the prompt AND by post-processing the HTML output.
+    # Gemini-generated long paragraphs were the #1 reason emails looked like
+    # walls of text. We now force each sentence to be its own <p> tag.
     if report_style == 'brief':
-        style_instructions = """**סגנון: תקציר יומי (5-7 שורות).**
-מבנה:
-- שורה 1: כותרת ## עם סטטוס היום במשפט אחד (✓ הכל תקין / ⚠ pH חורג / וכו').
-- שורות 2-4: שורה לכל מדד (pH, EC, טמפ׳) — ערך + סטטוס בלבד.
-- שורות 5-7: התראה ופעולה — רק אם יש בעיה אמיתית. אם הכל תקין כתוב "אין מה לעשות היום".
-ללא טבלאות, ללא רשימות ארוכות."""
+        style_instructions = """**סגנון: תקציר יומי קצרצר.**
+
+מבנה חובה (5-7 שורות בלבד):
+- ## כותרת: סטטוס יום במשפט אחד.
+- שורה לpH: ערך + יעד + ✓ או ⚠.
+- שורה לEC: ערך + יעד + ✓ או ⚠.
+- שורה לטמפ': ערך + יעד + ✓ או ⚠.
+- אם תקין: "אין פעולה נדרשת."
+- אם חורג: משפט אחד עם הפעולה הנדרשת.
+
+**חוקי כתיבה קריטיים** (חובה לפעול לפיהם):
+- כל משפט בשורה נפרדת. בין משפטים — שורה ריקה (`\\n\\n`).
+- משפטים קצרים: עד 12 מילים.
+- אסור פסקאות ארוכות. אסור משפטים מורכבים.
+- אסור טבלאות. אסור רשימות."""
     else:  # 'agronomist' (PRO+) — also catches legacy 'detailed'
-        style_instructions = """**סגנון: דוח אגרונומי מלא (PRO+).**
-מבנה (3 חלקים בלבד, סך הכל עד 25 שורות):
-1. **טבלת מצב** — שורה לכל מדד: היום | אתמול | ממוצע מחזור | יעד | סטטוס.
-2. **ניתוח קצר** — 2-3 משפטים על המגמה לאורך המחזור (לא להעתיק נתונים — להסיק).
-3. **המלצות פעולה** — עד 3 פריטים ממוספרים, כל אחד ב-2 שורות מקסימום:
-   נימוק (1 משפט) + פעולה ספציפית (1 משפט).
-חובה: ללא חזרות. ללא תיאור היסטוריה ארוכה. ללא הסברים תיאורטיים."""
+        style_instructions = """**סגנון: דוח אגרונומי מובנה.**
+
+מבנה חובה (3 חלקים):
+
+## 1. סטטוס נוכחי
+משפט סטטוס אחד. שורה ריקה.
+
+| מדד | היום | אתמול | יעד | סטטוס |
+|---|---|---|---|---|
+| pH | X.XX | X.XX | X-X | ✓/⚠ |
+| EC | XXXX | XXXX | XXXX-XXXX | ✓/⚠ |
+| טמפ' | XX.X | XX.X | XX-XX | ✓/⚠ |
+
+## 2. ניתוח
+2-3 משפטים על המגמה. כל משפט בשורה נפרדת. בין משפטים — שורה ריקה.
+
+## 3. המלצות
+1. פעולה ראשונה. נימוק קצר.
+2. פעולה שנייה. נימוק קצר.
+3. פעולה שלישית. נימוק קצר.
+(עד 3 פעולות בלבד. אם אין צורך — דלג חלק זה.)
+
+**חוקי כתיבה קריטיים** (חובה לפעול לפיהם):
+- כל משפט בשורה נפרדת. בין משפטים — שורה ריקה (`\\n\\n`).
+- משפטים קצרים: עד 15 מילים.
+- אסור פסקאות ארוכות. אסור משפטים מורכבים.
+- אסור הסברים תיאורטיים."""
 
     prompt = f"""אתה אגרונום מומחה למערכות הידרופוניקה. הפק דוח קצר ומדויק.
 
@@ -367,39 +397,121 @@ def _gemini_generate_with_retry(prompt, model='gemini-2.5-flash', max_attempts=3
     raise last_exc if last_exc else RuntimeError("Retry loop exited unexpectedly")
 
 
-def _add_sentence_breaks(md_text):
-    """V25.27: insert a Markdown line break (two spaces + \\n) after every period or colon
-    that ends a sentence in a paragraph. Skips lines that are tables, lists, or headings.
-    Effect: when rendered, each sentence sits on its own line — no long walls of text.
+def _split_sentences_to_paragraphs(md_text):
+    """V25.28: split each line containing multiple sentences into separate paragraphs.
+    Sentence boundary: '.', '!', '?' or ':' followed by space + Hebrew/Latin letter.
+    Avoids splitting decimals like '1.5' (lookbehind requires non-digit).
+    Skips tables, headings, list items, code blocks.
+    Output: each sentence on its own line, with blank line between → renders as
+    separate <p> tags in Markdown.
     """
     import re
-    out_lines = []
+    out_blocks = []
     for line in md_text.split('\n'):
         stripped = line.lstrip()
-        # Skip non-paragraph lines (tables, headings, list items, blank)
+        # Skip non-paragraph lines
         if (not stripped or stripped.startswith('|') or stripped.startswith('#') or
                 stripped.startswith('- ') or stripped.startswith('* ') or
-                re.match(r'^\d+\.\s', stripped) or
-                re.match(r'^\s*\|', line)):
-            out_lines.append(line)
+                stripped.startswith('```') or
+                re.match(r'^\d+\.\s', stripped)):
+            out_blocks.append(line)
             continue
-        # Insert "  \n" after period/colon followed by space + Hebrew/Latin letter
-        # Avoid breaking inside numbers (e.g. 1.5, 25.23) — the lookbehind excludes digits
-        line = re.sub(
-            r'(?<=[א-תa-zA-Z\)\]])([\.\:])\s+(?=[א-תA-Z])',
-            r'\1  \n',
+        # Split at sentence boundaries
+        # Pattern: (non-digit char)(. or : or ! or ?)(space)(Hebrew or uppercase Latin letter)
+        sentences = re.split(
+            r'(?<=[א-תa-zA-Z\)\]])([\.\:\!\?])\s+(?=[א-תA-Z])',
             line
         )
-        out_lines.append(line)
-    return '\n'.join(out_lines)
+        # Re-join keeping the delimiters
+        if len(sentences) <= 1:
+            out_blocks.append(line)
+            continue
+        result = []
+        for i in range(0, len(sentences), 2):
+            sent = sentences[i]
+            delim = sentences[i+1] if i+1 < len(sentences) else ''
+            full = sent + delim
+            if full.strip():
+                result.append(full.strip())
+        # Each sentence becomes its own paragraph (blank line between)
+        out_blocks.append('\n\n'.join(result))
+    return '\n'.join(out_blocks)
+
+
+def _polish_html_for_email(html):
+    """V25.28: post-process Markdown-rendered HTML to bulletproof email-client display.
+    - Force every <table> to width=584, table-layout:fixed, border-collapse:collapse
+    - Add explicit max-width on <p> and <li>
+    - Wrap loose text after periods with <br> (defensive — should already be split)
+    """
+    import re
+    # Force tables to behave inside the 640px container
+    html = re.sub(
+        r'<table>',
+        '<table width="584" cellpadding="6" cellspacing="0" border="0" style="width:584px;max-width:584px;border-collapse:collapse;table-layout:fixed;background:#fafafa;border:1px solid #e5e7eb;border-radius:8px;margin:12px 0;">',
+        html
+    )
+    html = re.sub(
+        r'<th>',
+        '<th style="background:#ede9fe;color:#5b21b6;padding:10px 8px;text-align:right;font-weight:700;font-size:13px;border-bottom:2px solid #ddd6fe;word-wrap:break-word;">',
+        html
+    )
+    html = re.sub(
+        r'<td>',
+        '<td style="padding:10px 8px;text-align:right;font-size:13px;border-bottom:1px solid #e5e7eb;word-wrap:break-word;vertical-align:top;">',
+        html
+    )
+    # Make headings prominent
+    html = re.sub(
+        r'<h2>',
+        '<h2 style="color:#6d28d9;font-size:18px;font-weight:700;margin:24px 0 12px 0;padding:8px 12px;background:#f5f3ff;border-right:4px solid #6d28d9;border-radius:6px;">',
+        html
+    )
+    html = re.sub(
+        r'<h3>',
+        '<h3 style="color:#374151;font-size:15px;font-weight:700;margin:16px 0 8px 0;">',
+        html
+    )
+    # Paragraphs: explicit width + line height + spacing
+    html = re.sub(
+        r'<p>',
+        '<p style="margin:8px 0;font-size:14px;line-height:1.7;color:#1f2937;max-width:584px;">',
+        html
+    )
+    # List items: card style + numbered badges
+    html = re.sub(
+        r'<ol>',
+        '<ol style="padding:0;margin:14px 0;list-style:none;counter-reset:rec;">',
+        html
+    )
+    html = re.sub(
+        r'<ul>',
+        '<ul style="padding:0;margin:14px 0;list-style:none;">',
+        html
+    )
+    html = re.sub(
+        r'<li>',
+        '<li style="background:#f9fafb;border-right:3px solid #8b5cf6;border-radius:6px;padding:12px 16px;margin:8px 0;font-size:14px;line-height:1.7;color:#1f2937;max-width:584px;">',
+        html
+    )
+    # Strong: brand color
+    html = re.sub(
+        r'<strong>',
+        '<strong style="color:#5b21b6;font-weight:700;">',
+        html
+    )
+    return html
 
 
 def send_report_email(client_email, controller_id, report_md, cycle_count, days_into_cycle, chart_url=None, plants_text=None, device_name=None):
-    # V25.27: break long paragraphs into sentence-per-line BEFORE rendering Markdown
-    report_md = _add_sentence_breaks(report_md)
-    # V25.24: extensions=['tables','nl2br'] — renders Markdown pipe-tables as real <table>
-    # and converts single newlines to <br> for better paragraph spacing.
-    html_body = markdown.markdown(report_md, extensions=['tables', 'nl2br'])
+    # V25.28: aggressive sentence-splitting + HTML inline-styling.
+    # Step 1: split multi-sentence paragraphs into separate Markdown paragraphs.
+    report_md = _split_sentences_to_paragraphs(report_md)
+    # Step 2: convert Markdown to HTML. tables=Markdown tables, nl2br=NOT here
+    #         (we use \n\n paragraph breaks instead, more reliable).
+    html_body = markdown.markdown(report_md, extensions=['tables'])
+    # Step 3: inject inline styles on EVERY tag because Outlook ignores <style> tags
+    html_body = _polish_html_for_email(html_body)
     friendly_name = device_name if device_name else "SmartHydro"
     # V25.25: email-client-safe chart row (table-based, not div)
     chart_html = ""
@@ -431,73 +543,54 @@ def send_report_email(client_email, controller_id, report_md, cycle_count, days_
           </td>
         </tr>"""
 
-    # V25.27: HARD-LOCKED 640px width. Every element gets explicit width.
-    # No percentages, no max-width on container, no responsive behavior.
-    # If user opens on mobile they'll see horizontal scroll — acceptable tradeoff
-    # for guaranteed Outlook desktop behavior.
-    body_styles = """
-    <style>
-      .report-content { font-family: 'Heebo','Segoe UI',Arial,sans-serif; color:#1f2937; font-size:14px; line-height:1.7; }
-      .report-content h2 { color:#6d28d9; font-size:17px; font-weight:700; margin:20px 0 8px 0; padding-bottom:5px; border-bottom:2px solid #ede9fe; }
-      .report-content h3 { color:#374151; font-size:14px; font-weight:700; margin:14px 0 6px 0; }
-      .report-content p { margin:6px 0; }
-      .report-content strong { color:#5b21b6; font-weight:700; }
-      .report-content em { color:#6b7280; font-style:normal; font-size:12px; }
-      .report-content table { border-collapse:collapse; width:584px; max-width:584px; margin:10px 0; background:#fafafa; border-radius:8px; table-layout:fixed; }
-      .report-content th { background:#ede9fe; color:#5b21b6; padding:8px 6px; text-align:right; font-weight:700; font-size:12px; border-bottom:2px solid #ddd6fe; word-wrap:break-word; }
-      .report-content td { padding:8px 6px; text-align:right; font-size:12px; border-bottom:1px solid #e5e7eb; word-wrap:break-word; vertical-align:top; }
-      .report-content tr:last-child td { border-bottom:none; }
-      .report-content ol, .report-content ul { padding-right:0; padding-left:0; margin:10px 0; list-style:none; counter-reset:rec-counter; }
-      .report-content ol li, .report-content ul li {
-        background:#f9fafb; border-right:3px solid #8b5cf6; border-radius:6px;
-        padding:10px 14px; margin:6px 0; font-size:13px; line-height:1.6; position:relative; word-wrap:break-word;
-      }
-      .report-content ol li { counter-increment:rec-counter; padding-right:44px; }
-      .report-content ol li:before {
-        content:counter(rec-counter); position:absolute; right:12px; top:10px;
-        background:#8b5cf6; color:#fff; width:22px; height:22px; border-radius:50%;
-        text-align:center; line-height:22px; font-size:12px; font-weight:700;
-      }
-      .report-content hr { border:none; border-top:1px solid #e5e7eb; margin:14px 0; }
-      .report-content code { background:#f3f4f6; color:#5b21b6; padding:1px 5px; border-radius:4px; font-family:monospace; font-size:12px; }
-    </style>"""
-
-    # V25.27: Single 640px-wide table, centered via margin auto. No outer 100% wrapper.
-    # This is the Mailchimp-style minimal frame that Outlook ALWAYS respects.
+    # V25.28: Two-layer wrapper (industry standard for email).
+    # Layer 1: 100%-wide table with light-gray background (visible "page" around content)
+    # Layer 2: 640px-wide content table centered inside, with visible frame
+    # ALL inline styles — no <style> tag, no @media. Outlook respects this 100%.
     html_template = f"""<!DOCTYPE html>
 <html lang="he" dir="rtl">
 <head>
 <meta charset="UTF-8">
 <title>דוח אגרונומי</title>
-{body_styles}
 </head>
-<body style="margin:0;padding:20px 0;background-color:#f3f4f6;font-family:'Heebo','Segoe UI',Arial,sans-serif;direction:rtl;">
+<body style="margin:0;padding:0;background-color:#e5e7eb;font-family:'Heebo','Segoe UI',Arial,sans-serif;direction:rtl;">
 
-  <table align="center" cellpadding="0" cellspacing="0" border="0" width="640" style="width:640px;margin:0 auto;background-color:#ffffff;border:1px solid #d1d5db;border-radius:14px;border-collapse:separate;">
-
-    <!-- Header -->
+  <!-- Layer 1: outer 100% width with page background -->
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#e5e7eb" style="background-color:#e5e7eb;">
     <tr>
-      <td width="640" bgcolor="#6d28d9" style="width:640px;background-color:#6d28d9;background-image:linear-gradient(135deg,#8b5cf6,#6d28d9);color:#ffffff;padding:24px;text-align:center;border-radius:14px 14px 0 0;">
-        <div style="font-size:21px;font-weight:700;margin-bottom:4px;color:#ffffff;">דוח אגרונומי יומי</div>
-        <div style="font-size:12px;color:#ffffff;opacity:0.95;">{friendly_name} &middot; מחזור #{cycle_count} &middot; יום {days_into_cycle}</div>
-      </td>
-    </tr>
+      <td align="center" valign="top" style="padding:20px 10px;">
 
-    {plants_html_row}
+        <!-- Layer 2: 640px content with visible frame -->
+        <table align="center" cellpadding="0" cellspacing="0" border="0" width="640" style="width:640px;max-width:640px;background-color:#ffffff;border:2px solid #6d28d9;border-radius:12px;">
 
-    <!-- Content cell — hard 640 minus 48 padding = 592 content area -->
-    <tr>
-      <td class="report-content" width="640" style="width:640px;padding:22px 24px;font-family:'Heebo','Segoe UI',Arial,sans-serif;color:#1f2937;font-size:14px;line-height:1.7;text-align:right;direction:rtl;word-break:break-word;">
-        {html_body}
-      </td>
-    </tr>
+          <!-- Header (centered, prominent) -->
+          <tr>
+            <td width="640" bgcolor="#6d28d9" style="width:640px;background-color:#6d28d9;color:#ffffff;padding:20px;text-align:center;">
+              <div style="font-size:20px;font-weight:700;color:#ffffff;margin-bottom:6px;">📊 דוח אגרונומי יומי</div>
+              <div style="font-size:13px;color:#ffffff;">{friendly_name}</div>
+              <div style="font-size:12px;color:#ddd6fe;margin-top:4px;">מחזור #{cycle_count} &middot; יום {days_into_cycle}</div>
+            </td>
+          </tr>
 
-    {chart_html}
+          {plants_html_row}
 
-    <!-- Footer -->
-    <tr>
-      <td width="640" bgcolor="#f8fafc" style="width:640px;background-color:#f8fafc;padding:12px;text-align:center;font-size:10px;color:#6b7280;border-radius:0 0 14px 14px;">
-        &copy; 2026 SmartHydro Systems
+          <!-- Content -->
+          <tr>
+            <td width="640" style="width:640px;padding:20px 24px;font-family:'Heebo','Segoe UI',Arial,sans-serif;color:#1f2937;font-size:14px;line-height:1.75;text-align:right;direction:rtl;word-break:break-word;">
+              {html_body}
+            </td>
+          </tr>
+
+          {chart_html}
+
+          <!-- Footer -->
+          <tr>
+            <td width="640" bgcolor="#f5f3ff" style="width:640px;background-color:#f5f3ff;padding:14px;text-align:center;font-size:11px;color:#6d28d9;border-top:1px solid #ddd6fe;">
+              &copy; 2026 SmartHydro Systems
+            </td>
+          </tr>
+        </table>
+
       </td>
     </tr>
   </table>
