@@ -20,41 +20,104 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-import firebase_admin
-from firebase_admin import credentials, db
-from google import genai
-import markdown
+# V25.30: heavy cloud SDKs imported lazily so the test harness can import
+# this module without requiring firebase-admin / google-genai on the local
+# machine. The production cron path (process_all_controllers) imports them
+# inside _ensure_firebase / _ensure_gemini before any external call.
+try:
+    import firebase_admin
+    from firebase_admin import credentials, db
+except ImportError:
+    firebase_admin = None  # type: ignore
+    credentials = None     # type: ignore
+    db = None              # type: ignore
 
-# ============ Plant data (mirror של plants.js – לתיאור בדוח Gemini) ============
-PLANT_NAMES_HE = {
-    'tomato': 'עגבנייה', 'cucumber': 'מלפפון', 'pepper': 'פלפל', 'lettuce': 'חסה',
-    'basil': 'בזיליקום', 'strawberry': 'תות שדה', 'kale': 'קייל', 'spinach': 'תרד',
-    'mint': 'נענע', 'parsley': 'פטרוזיליה', 'cilantro': 'כוסברה', 'chives': 'עירית',
-    'bok_choy': 'בוק צ\'וי', 'swiss_chard': 'מנגולד', 'arugula': 'אורוגולה',
-    'celery': 'סלרי', 'broccoli': 'ברוקולי', 'cauliflower': 'כרובית',
-    'eggplant': 'חציל', 'zucchini': 'קישוא', 'beans': 'שעועית', 'peas': 'אפונה',
-    'oregano': 'אורגנו', 'thyme': 'טימין', 'rosemary': 'רוזמרין', 'sage': 'מרווה',
-    'stevia': 'סטיביה', 'watercress': 'גרגיר הנחלים', 'dill': 'שמיר', 'mustard': 'חרדל'
-}
-STAGE_NAMES_HE = {
-    'seedling': 'סטרטר', 'vegetative': 'צמיחה', 'fruiting': 'פריחה/פרי',
-    'all': 'כל השלבים', 'vegfruit': 'צמיחה/פרי'
-}
+try:
+    from google import genai
+except ImportError:
+    genai = None  # type: ignore
+
+try:
+    import markdown
+except ImportError:
+    markdown = None  # type: ignore
+
+# ============ Plant catalog access (V25.30) ============
+# Previous PLANT_NAMES_HE was a hardcoded 30-entry dict — the LLM never saw
+# `notes_he`, `family_he`, `cycle_days`, or per-stage pH/EC targets, so
+# crop-specific insight was structurally impossible.
+#
+# `plants_catalog.py` (auto-generated from public/plants.js by
+# scripts/build_plants_catalog.py) gives full 54-species context. See briefing
+# §3.4 + §11.4 for the data we now surface to Gemini.
+try:
+    from plants_catalog import get_plant_context, PLANTS as _PLANTS_CATALOG
+except ImportError:
+    _PLANTS_CATALOG = {}
+    def get_plant_context(plant_id, stage_id=None):  # type: ignore[no-redef]
+        return None
 
 
-def format_plants_for_prompt(plants_list):
-    """ממיר רשימת צמחים מ-RTDB לטקסט קריא ל-Gemini."""
+def _short_plant_label(plants_list):
+    """Compact one-line label for header / chart caption. Falls back to id
+    when the plant is not in the catalog (shouldn't happen in normal use)."""
     if not plants_list:
         return None
     parts = []
     for p in plants_list:
         pid = p.get('id', '')
         qty = p.get('qty', 1)
-        stage = p.get('stage', '')
-        name = PLANT_NAMES_HE.get(pid, pid)
-        stage_he = STAGE_NAMES_HE.get(stage, stage)
-        parts.append(f"{name} ({stage_he}) ×{qty}")
-    return ", ".join(parts)
+        ctx = get_plant_context(pid, p.get('stage'))
+        name = (ctx['name_he'] if ctx else pid)
+        stage_label = (ctx['stage_label_he'] if ctx else p.get('stage', ''))
+        parts.append(f"{name} ({stage_label}) ×{qty}")
+    return ', '.join(parts)
+
+
+# Kept for backward compatibility with the existing email-send call site that
+# still asks for a plants_text label.
+def format_plants_for_prompt(plants_list):
+    return _short_plant_label(plants_list)
+
+
+def _build_plants_section(plants_list):
+    """Return the enriched per-plant block that goes into the LLM prompt.
+    Each plant gets: name_he, family_he, cycle_days, qty, stage label,
+    stage pH/EC targets, ec_critical, ph_critical, notes_he verbatim.
+    Returns a multi-line Hebrew string."""
+    if not plants_list:
+        return '(לא הוגדרו צמחים — דווח על המים כללית, ללא תובנות אגרונומיות ספציפיות.)'
+    lines = []
+    for p in plants_list:
+        pid = p.get('id', '')
+        qty = p.get('qty', 1)
+        stage_id = p.get('stage', 'all')
+        ctx = get_plant_context(pid, stage_id)
+        if not ctx:
+            # Unknown plant — give the model just the id so it doesn't bluff
+            lines.append(f"- {pid} ×{qty} (אין נתוני קטלוג — דווח רק על המדדים הגנריים).")
+            continue
+        ph_t = ctx['ph_target']
+        ec_t = ctx['ec_target']
+        ph_c = ctx['ph_critical']
+        ph_range = f"{ph_t[0]}-{ph_t[1]}" if ph_t else '?'
+        ec_range = f"{ec_t[0]}-{ec_t[1]}" if ec_t else '?'
+        ec_crit = ctx['ec_critical'] or '?'
+        ph_crit = f"{ph_c[0]}-{ph_c[1]}" if ph_c else '?'
+        lines.append(
+            f"- {ctx['name_he']} (משפחה: {ctx['family_he']}, מחזור טיפוסי: "
+            f"{ctx['cycle_days']} ימים), {qty} צמחים, שלב: {ctx['stage_label_he']}.\n"
+            f"    יעדים לשלב: pH {ph_range}, EC {ec_range} µS, EC קריטי {ec_crit} µS.\n"
+            f"    pH קריטי: {ph_crit}.\n"
+            f"    הערות אגרונומיות: {ctx['notes_he']}"
+        )
+    return '\n'.join(lines)
+
+
+def _allowed_history_dates_set(history_entries):
+    """Convert history list-of-tuples to a set of DD/MM strings for the
+    date-integrity validator."""
+    return {d.strftime('%d/%m') for d, _ in history_entries}
 
 
 def build_consumption_chart_url(history_entries, targets=None):
@@ -96,63 +159,114 @@ def build_consumption_chart_url(history_entries, targets=None):
         }
     ]
 
-    # Add target range bands as faint dashed lines if available
-    if ph_min is not None and ph_max is not None:
+    # Add target range bands as faint dashed lines if available.
+    # V25.30: only the upper bound gets a legend entry (single labeled trace
+    # per axis). The lower bound is suppressed from the legend by routing it
+    # to a "hidden" dataset technique — Chart.js v3 has no `filter:` string
+    # support in QuickChart (must be a real function), so we drop the legend
+    # filter and instead omit the redundant lower-bound trace from the legend
+    # by giving it `showLine=True` but no label, and setting
+    # `plugins.legend.labels.boxWidth=0` on the dataset via a workaround.
+    # Pragmatic choice: just skip the lower-bound trace entirely. The customer
+    # sees the upper "ceiling" dashed line which is the more useful guide
+    # (tip-burn and lockout are upper-bound failures).
+    if ph_max is not None:
         datasets.append({
-            "label": f"יעד pH ({ph_min}-{ph_max})", "data": [ph_max] * len(labels),
+            "label": f"תקרת pH ({ph_max})", "data": [ph_max] * len(labels),
             "borderColor": "rgba(59,130,246,0.35)", "borderDash": [4, 4],
             "borderWidth": 1, "pointRadius": 0, "yAxisID": "yPh", "fill": False
         })
+    if ec_max is not None:
         datasets.append({
-            "label": "", "data": [ph_min] * len(labels),
-            "borderColor": "rgba(59,130,246,0.35)", "borderDash": [4, 4],
-            "borderWidth": 1, "pointRadius": 0, "yAxisID": "yPh", "fill": False
-        })
-    if ec_min is not None and ec_max is not None:
-        datasets.append({
-            "label": f"יעד EC ({ec_min}-{ec_max})", "data": [ec_max] * len(labels),
-            "borderColor": "rgba(16,185,129,0.35)", "borderDash": [4, 4],
-            "borderWidth": 1, "pointRadius": 0, "yAxisID": "yEc", "fill": False
-        })
-        datasets.append({
-            "label": "", "data": [ec_min] * len(labels),
+            "label": f"תקרת EC ({ec_max} µS)", "data": [ec_max] * len(labels),
             "borderColor": "rgba(16,185,129,0.35)", "borderDash": [4, 4],
             "borderWidth": 1, "pointRadius": 0, "yAxisID": "yEc", "fill": False
         })
 
+    # V25.30: Chart.js v3+ schema — QuickChart upgraded and the old v2 syntax
+    # (yAxes array, scaleLabel, gridLines, legend.labels.filter as string)
+    # now returns HTTP 400. Equivalent v3 mapping:
+    #   yAxes: [{id:'yPh'}]            → scales: {yPh: {...}}
+    #   scaleLabel: {display, label}   → title: {display, text}
+    #   gridLines: {drawOnChartArea}   → grid: {drawOnChartArea}
+    #   top-level title / legend       → plugins.title / plugins.legend
     chart_config = {
         "type": "line",
         "data": {"labels": labels, "datasets": datasets},
         "options": {
-            "title": {"display": True, "text": "מגמת pH ו-EC לאורך המחזור", "fontSize": 16},
-            "legend": {"position": "bottom", "labels": {"filter": "function(item){return item.text!=='';}"}},
+            "plugins": {
+                "title": {"display": True, "text": "מגמת pH ו-EC לאורך המחזור",
+                          "font": {"size": 16}},
+                "legend": {"position": "bottom"}
+            },
             "scales": {
-                "yAxes": [
-                    {"id": "yPh", "position": "right", "scaleLabel": {"display": True, "labelString": "pH"},
-                     "ticks": {"min": 4, "max": 8, "stepSize": 0.5}, "gridLines": {"drawOnChartArea": False}},
-                    {"id": "yEc", "position": "left", "scaleLabel": {"display": True, "labelString": "EC (µS)"},
-                     "ticks": {"min": 0, "stepSize": 500}}
-                ],
-                "xAxes": [{"scaleLabel": {"display": True, "labelString": "תאריך"}}]
+                "yPh": {"position": "right",
+                        "title": {"display": True, "text": "pH"},
+                        "min": 4, "max": 8,
+                        "ticks": {"stepSize": 0.5},
+                        "grid": {"drawOnChartArea": False}},
+                "yEc": {"position": "left",
+                        "title": {"display": True, "text": "EC (µS)"},
+                        "min": 0,
+                        "ticks": {"stepSize": 500}},
+                "x": {"title": {"display": True, "text": "תאריך"}}
             }
         }
     }
+    # Each dataset's yAxisID also moves: in v3 the key matches scales keys.
+    for ds in datasets:
+        if ds.get("yAxisID") == "yPh":
+            ds["yAxisID"] = "yPh"
+        elif ds.get("yAxisID") == "yEc":
+            ds["yAxisID"] = "yEc"
     encoded = urllib.parse.quote(json.dumps(chart_config, ensure_ascii=False))
-    return f"https://quickchart.io/chart?c={encoded}&w=640&h=360&bkg=white"
+    return f"https://quickchart.io/chart?c={encoded}&w=640&h=360&bkg=white&v=4"
 
 # --- משתני סביבה (GitHub Actions secrets) ---
+# V25.30: lazy initialization — Firebase and Gemini clients are created on
+# first use, not at import. Lets the test harness in scripts/test_reports.py
+# import ai_manager without supplying Firebase credentials. The production
+# cron path (process_all_controllers) still calls _ensure_clients() before
+# any external calls.
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL")
 SENDER_EMAIL = os.getenv("GMAIL_USER")
 SENDER_PASSWORD = os.getenv("GMAIL_PASS")
-service_account_info = json.loads(os.getenv("FIREBASE_SERVICE_ACCOUNT"))
 
-print("Connecting to Firebase and Gemini...")
-cred = credentials.Certificate(service_account_info)
-if not firebase_admin._apps:
+client = None  # genai.Client — initialized lazily
+
+
+def _ensure_firebase():
+    """Initialize Firebase Admin once. Raises if FIREBASE_SERVICE_ACCOUNT is
+    missing — production runs always have it via GitHub Actions secrets."""
+    if firebase_admin is None:
+        raise RuntimeError("firebase-admin not installed; install with "
+                           "`pip install firebase-admin` for production use.")
+    if firebase_admin._apps:
+        return
+    raw = os.getenv("FIREBASE_SERVICE_ACCOUNT")
+    if not raw:
+        raise RuntimeError("FIREBASE_SERVICE_ACCOUNT env var is required")
+    print("Connecting to Firebase...")
+    cred = credentials.Certificate(json.loads(raw))
     firebase_admin.initialize_app(cred, {'databaseURL': DATABASE_URL})
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+
+def _ensure_gemini():
+    """Create the Gemini client on first call. Raises if GEMINI_API_KEY is
+    missing — caller decides how to surface that to the user."""
+    global client
+    if client is not None:
+        return client
+    if genai is None:
+        raise RuntimeError("google-genai not installed; install with "
+                           "`pip install google-genai` to run live reports.")
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY env var is required")
+    print("Connecting to Gemini...")
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    return client
+
 
 REPORT_TIERS = ('pro', 'pro_plus')
 
@@ -209,171 +323,317 @@ def format_history_for_prompt(entries):
     return "\n".join(lines)
 
 
-def generate_report(controller_id, settings, history_entries, cycle_start_dt, cycle_count, device_name=None, report_style='brief'):
-    # PWA v25: report_style מגיע מ-email_prefs של המשתמש: 'brief' | 'detailed' | 'agronomist'
-    style_pref = settings.get('ai_style', 'professional') if isinstance(settings, dict) else 'professional'
-    style_text = ('מקצועי, מדעי ואנליטי' if style_pref == 'professional'
-                  else 'קליל, ידידותי, ובגובה העיניים למגדל הביתי')
+# V25.30: Insight-driven report generator with automated quality gates.
+#
+# Why the rewrite (full context in REPORTS_AGENT_BRIEFING.md):
+# - The previous prompt was monolithic (~400 lines mixing role, rules,
+#   forbidden examples, insight examples, output template, all crammed into
+#   one f-string). The LLM prioritized the wrong sections.
+# - Plant context lost — only the plant name was passed. notes_he,
+#   family_he, cycle_days, per-stage targets, ec_critical never reached
+#   the model.
+# - No post-generation validation — reports with forbidden phrases shipped
+#   to customers anyway. Five iterations of prompt edits failed to fix
+#   this because the failure mode was structural, not textual.
+#
+# The new flow:
+#   1. Build a modular prompt: anchored date/cycle (Python-computed),
+#      enriched per-plant block (catalog-driven), targets context, history,
+#      style-specific output template demanding **[Category]** tags on
+#      every insight.
+#   2. Call _gemini_generate_with_fallback (3-model chain, unchanged).
+#   3. Run 5 quality validators from scripts/report_validators.py.
+#   4. On any test fail, regenerate with a targeted hint (max 3 attempts).
+#   5. If all attempts fail → return a hand-written degraded report
+#      ("no insights available today") rather than ship bad output.
+#
+# Validation runs are logged so we can track which tests fail most often
+# and tune the prompt over time.
+_MAX_REGEN_ATTEMPTS = 3
 
-    # שם ידידותי במקום MAC – או כינוי המשתמש או "המערכת שלך"
-    friendly_name = device_name if device_name else "המערכת"
+# Allow `from scripts.report_validators import ...` regardless of where the
+# script is invoked from. The Hydro-OTA deployment ships scripts/ alongside.
+import sys as _sys  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+_SCRIPTS_DIR = _Path(__file__).resolve().parent / 'scripts'
+if str(_SCRIPTS_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SCRIPTS_DIR))
+try:
+    from report_validators import run_all as _validate_run_all  # type: ignore
+except Exception:
+    _validate_run_all = None  # validators missing → skip gates, log a warning
 
-    targets = {
-        'temp_min': settings.get('temp_min', '?'), 'temp_max': settings.get('temp_max', '?'),
-        'ph_min': settings.get('ph_min', '?'), 'ph_max': settings.get('ph_max', '?'),
-        'ec_min': settings.get('ec_min', '?'), 'ec_max': settings.get('ec_max', '?'),
-    } if isinstance(settings, dict) else {}
 
-    cycle_str = cycle_start_dt.strftime('%d/%m/%Y') if cycle_start_dt else "לא הוגדר"
-    days_into_cycle = (datetime.now().date() - cycle_start_dt.date()).days if cycle_start_dt else "?"
+HEBREW_WEEKDAYS = ['שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת', 'ראשון']
 
-    # V25.24: Explicit date anchor — prevents Gemini from hallucinating dates
-    today_iso = datetime.now().strftime('%Y-%m-%d')      # 2026-06-07
-    today_dmy = datetime.now().strftime('%d/%m/%Y')      # 07/06/2026
-    today_weekday_he = ['שני','שלישי','רביעי','חמישי','שישי','שבת','ראשון'][datetime.now().weekday()]
 
-    today_summary = ""
+def _format_history_compact(entries, last_n=14):
+    """Last N days of history, one line per day. Saves tokens vs full cycle."""
+    if not entries:
+        return '(אין עדיין נתונים יומיים מאז תחילת המחזור)'
+    recent = entries[-last_n:]
+    lines = []
+    for d, data in recent:
+        ph = data.get('ph_avg', 0) or 0
+        ec = int(data.get('ec_avg', 0) or 0)
+        t = data.get('temp_avg', 0) or 0
+        lines.append(f"[{d.strftime('%d/%m')}] pH={ph:.2f}, EC={ec}, T={t:.1f}°C")
+    return '\n'.join(lines)
+
+
+def _build_prompt(*, today_dt, cycle_start_dt, cycle_count, days_into_cycle,
+                  settings, history_entries, report_style, retry_hint=None):
+    """Assemble the modular prompt. retry_hint is appended only on regeneration
+    attempts after a validation failure."""
+    today_iso = today_dt.strftime('%Y-%m-%d')
+    today_dmy = today_dt.strftime('%d/%m/%Y')
+    weekday_he = HEBREW_WEEKDAYS[today_dt.weekday()]
+    cycle_str = cycle_start_dt.strftime('%d/%m/%Y') if cycle_start_dt else 'לא הוגדר'
+
+    plants_list = settings.get('plants', []) if isinstance(settings, dict) else []
+    plants_section = _build_plants_section(plants_list)
+
+    targets_auto_or_manual = ('יעדים שהוגדרו ידנית על ידי המגדל '
+                              '(override של בחירת הצמח)'
+                              if settings.get('targets_manual_override')
+                              else 'יעדים אוטומטיים על-פי בחירת הצמח')
+
+    today_summary = ''
     if history_entries:
         d, data = history_entries[-1]
-        today_summary = (f"היום ({d.strftime('%d/%m/%Y')}): pH={data.get('ph_avg', 0):.2f}, "
-                         f"EC={data.get('ec_avg', 0):.0f}, Temp={data.get('temp_avg', 0):.1f}°C")
+        today_summary = (f"pH {data.get('ph_avg', 0):.2f} | "
+                         f"EC {int(data.get('ec_avg', 0) or 0)} µS | "
+                         f"טמפ' {data.get('temp_avg', 0):.1f}°C")
 
-    # V13.27+: מידע על הצמחים שגדלים – לדוח מותאם אישית
-    plants_list = settings.get('plants', []) if isinstance(settings, dict) else []
-    plants_text = format_plants_for_prompt(plants_list)
-    plants_section = f"\nצמחים בגידול נוכחי: {plants_text}\n" if plants_text else "\n(לא הוגדרו צמחים ספציפיים בהגדרות.)\n"
-
-    # סיכום צריכת חומרים מצטברת
     total_ph_sec = sum(int(d.get('ph_sec_total', 0) or 0) for _, d in history_entries)
     total_ec_sec = sum(int(d.get('ec_sec_total', 0) or 0) for _, d in history_entries)
-    consumption_text = f"\nצריכת חומרים מצטברת במחזור: חומצה pH – {total_ph_sec} שניות, דשן EC – {total_ec_sec} שניות.\n"
 
-    # V25.29: INSIGHT-DRIVEN reports. The user (Shimon) raised a critical
-    # product issue: the previous reports were summaries of what the user
-    # already sees in the PWA — pH value, range status, etc. That's not AI
-    # value. Real AI value is INSIGHTS the user couldn't deduce on their own:
-    #   1. Trend extrapolation — "at this rate, X will happen in N days"
-    #   2. Cross-metric correlation — "X and Y are moving together, meaning Z"
-    #   3. Stage-specific advice — "day N of basil = expect X behavior next"
-    #   4. Crop-specific agronomy — "this plant prefers Y for Z outcome"
-    # Prompt now FORBIDS restating app data and DEMANDS at least one insight
-    # per metric per section.
+    rules_block = """=== חוקים נוקשים ===
+אסור להשתמש בביטויים הבאים — המגדל רואה אותם באפליקציה:
+- "בטווח התקין" / "ערכים תקינים" / "מצב תקין"
+- "המערכת תקינה" / "המערכת פועלת כראוי"
+- "המשך בניטור" / "עקוב אחרי" / "מומלץ לבדוק"
+- "בדוק את תקינות החיישן" (ללא נימוק ספציפי מהנתונים)
+- "אמת את הרצף" / "הקפד על תיעוד"
+- "אולי" / "כדאי" (חסר החלטיות — אסור בפעולות)
 
-    forbidden_examples = """**משפטים אסורים** (כי המשתמש רואה אותם באפליקציה):
-- "ה-pH בטווח / חורג מהיעד"
-- "המערכת תקינה / לא תקינה"
-- "המשך בניטור / עקוב אחרי X"
-- "מומלץ לבדוק תקינות"
-- "ערך EC הוא 1423 µS"
-- "ממוצע המחזור 1367 µS"
-שורות כאלה הן מילוי — אסור לכלול אותן."""
+כל תובנה חייבת לפתוח בתג קטגוריה באחד מ-5 הסוגים, בדיוק בתבנית הזו:
+**[Trend]**: קצב שינוי מספרי + תאריך/ערך עתידי + פעולה
+**[Correlation]**: שני מדדים + עוצמת קשר + הסבר ביולוגי
+**[Stage]**: יום במחזור + שם הצמח + מאפיין השלב + אירוע צפוי
+**[Agronomy]**: שם הצמח + עובדה ספציפית + קשר לנתון הנוכחי
+**[Anomaly]**: תאריך ספציפי + ערך + הסבר סביר"""
 
-    insight_examples = """**דוגמאות לתובנות אמיתיות שצריכות להופיע**:
+    anchors_block = f"""=== עוגני תאריך ומחזור ===
+תאריך היום: {today_dmy} ({weekday_he}, ISO {today_iso}).
+מחזור #{cycle_count}, יום {days_into_cycle} מתחילת המחזור (החל {cycle_str}).
+אל תחשב מחדש את היום. אל תמציא תאריך אחר."""
 
-חיזוי מגמה:
-- "ה-pH עולה ב-0.07 ביום ב-7 הימים האחרונים. בקצב הזה תעבור 6.5 בעוד 4 ימים."
-- "צריכת הדשן עלתה ב-40% השבוע. הגעת ל-185 שניות מצטברות. בקצב הזה תזדקק לתוספת בעוד 8 ימים."
+    plants_block = f"""=== צמחים במחזור ===
+{plants_section}"""
 
-קשר צולב בין מדדים:
-- "כל יום שהטמפ' עלתה ב-1°C, ה-EC צנח ב-50 µS. השורשים פעילים. בימי חום הוסף 15% דשן."
-- "ה-pH עולה כאשר ה-EC יורד — סימן לצריכת חנקה. תופעה תקינה לבזיליקום בשלב צמיחה."
+    targets_block = f"""=== יעדים נוכחיים ===
+pH {settings.get('ph_min', '?')}-{settings.get('ph_max', '?')} | EC {settings.get('ec_min', '?')}-{settings.get('ec_max', '?')} µS | טמפ׳ {settings.get('temp_min', '?')}-{settings.get('temp_max', '?')}°C
+({targets_auto_or_manual})"""
 
-התאמה לשלב הגידול:
-- "יום 22 של בזיליקום = שלב גידול עלים מואץ. צפי לצריכת דשן יוכפל בשבוע הקרוב."
-- "ב-3 ימים תגיע ל-50% המחזור. זה הזמן לקיצוץ ראשון לעידוד התפצלות."
+    readings_block = f"""=== נתוני היום ===
+{today_summary if today_summary else '(אין עדיין מדידה יומית להיום)'}
+צריכה מצטברת במחזור: חומצה pH — {total_ph_sec} שניות, דשן EC — {total_ec_sec} שניות."""
 
-אגרונומיה ספציפית לצמח:
-- "בזיליקום ב-EC 1400-1600 נותן רוב היבול. הימנע מעלייה מעל 1700 — פוגעת בשמנים אתריים."
-- "בזיליקום אוהב pH 5.8-6.2. בערכי 6.3+ ה-Fe פחות זמין — אם תראה צהיבות בעלים זה הסיבה."
-
-זיהוי אנומליות:
-- "EC צנח מ-1400 ל-4 ב-03/06 — חריג מאוד. כנראה שטיפת מערכת או נתק חיישן רגעי."
-- "טמפ' של 30.4°C ב-04/06 — מעל הסף הבטוח לבזיליקום (29°C). חזר מאז."
-"""
+    history_block = f"""=== היסטוריה (עד 14 ימים אחרונים) ===
+{_format_history_compact(history_entries)}"""
 
     if report_style == 'brief':
-        style_instructions = f"""**סגנון: תקציר יומי עם תובנה אחת.**
+        task_block = """=== משימה ===
+סגנון: תקציר יומי. מבנה חובה (6-10 שורות בלבד):
 
-מבנה חובה (6-8 שורות בלבד):
-- ## כותרת: סטטוס יום במשפט אחד.
-- שורה לpH: ערך + ✓ או ⚠.
-- שורה לEC: ערך + ✓ או ⚠.
-- שורה לטמפ': ערך + ✓ או ⚠.
-- **תובנה אחת** — חיזוי, קשר צולב, או עצה ספציפית לצמח. (חובה — לא לדלג).
-- אם חורג: משפט פעולה.
+## ✓ או ⚠ + סיכום סטטוס במשפט אחד
+[שורה ריקה]
+pH: X.XX ← מילה אחת על המגמה (יציב/עולה/יורד)
+[שורה ריקה]
+EC: XXXX µS ← מילה אחת על המגמה
+[שורה ריקה]
+טמפ': XX.X°C ← מילה אחת על המגמה
+[שורה ריקה]
+**[Trend|Agronomy|Stage|Correlation|Anomaly]**: תובנה אחת מבוססת מספרים. עד 18 מילים.
+[שורה ריקה]
+**פעולה**: פעולה ספציפית עם מספר. אם באמת אין צורך — "אין פעולה נדרשת — קצב הצריכה תואם את הצפוי".
 
-{forbidden_examples}
-
-{insight_examples}
-
-**חוקי כתיבה**:
-- כל משפט בשורה נפרדת. בין משפטים — שורה ריקה.
-- משפטים קצרים: עד 12 מילים.
-- חייב לכלול 1+ תובנה (מבין 4 הסוגים למעלה)."""
-
-    else:  # 'agronomist' (PRO+) — also catches legacy 'detailed'
-        style_instructions = f"""**סגנון: דוח אגרונומי מבוסס תובנות.**
-
-מבנה חובה (4 חלקים):
+פלט: רק Markdown בעברית. בלי הקדמה. בלי סיכום מסביב."""
+    else:
+        task_block = """=== משימה ===
+סגנון: דוח אגרונומי. מבנה חובה — בדיוק 4 חלקים בסדר הזה:
 
 ## 1. סטטוס נוכחי
-טבלה בלבד. שום משפט מסביב.
 
 | מדד | היום | אתמול | יעד | סטטוס |
 |---|---|---|---|---|
-| pH | X.XX | X.XX | X-X | ✓/⚠ |
-| EC | XXXX | XXXX | XXXX-XXXX | ✓/⚠ |
-| טמפ' | XX.X | XX.X | XX-XX | ✓/⚠ |
+| pH | X.XX | X.XX | X.X-X.X | ✓ או ⚠ |
+| EC | XXXX | XXXX | XXXX-XXXX | ✓ או ⚠ |
+| טמפ' | XX.X | XX.X | XX-XX | ✓ או ⚠ |
 
-## 2. תובנות (2-3 תובנות חובה)
-כל תובנה חייבת להיות מאחד מ-4 הסוגים:
-- חיזוי מגמה (מספרים מהקצב הנוכחי)
-- קשר צולב בין שני מדדים
-- התאמה לשלב הגידול ולצמחים הספציפיים
-- זיהוי אנומליה (אירוע חריג בעבר וההסבר)
+טבלה בלבד. בלי משפטים סביב.
 
-כל תובנה במשפט אחד-שניים. שורה ריקה בין תובנות.
+## 2. תובנות
+
+2-3 תובנות, **כל אחת בקטגוריה שונה**. כל תובנה במשפט אחד-שניים, מתחילה בתג:
+
+**[Trend]**: ...
+
+**[Correlation]**: ...
+
+**[Stage]** או **[Agronomy]** או **[Anomaly]**: ...
 
 ## 3. תחזית 3-5 ימים
-1-2 משפטים: מה צפוי לקרות לפי המגמות הנוכחיות?
-חובה לכלול תאריך/מספר ימים ספציפי.
 
-## 4. פעולות (עד 3)
-פעולה ספציפית עם נימוק מבוסס נתונים שלך — לא גנרי.
-דוגמה: "בעוד 3 ימים תזדקק לחומצה — תוודא שיש מלאי בבית" (לא "המשך בניטור").
+1-2 משפטים. **כל משפט חייב לכלול תאריך ספציפי או מספר ימים**. בלי "אולי" ו"כדאי".
 
-{forbidden_examples}
+## 4. פעולות
 
-{insight_examples}
+1-3 פעולות. כל פעולה בשורה ממוספרת, מתחילה בפועל בציווי (הוסף / הפעל / הכן / בצע) + נימוק מספרי מהנתונים.
+אם אין צורך בפעולה — בשורה אחת: "אין פעולות נדרשות — קצב הצריכה תואם את הצפוי".
 
-**חוקי כתיבה**:
-- כל משפט בשורה נפרדת. בין משפטים — שורה ריקה.
-- משפטים קצרים: עד 15 מילים.
-- כל תובנה חייבת להיות מבוססת מספרים מהנתונים שלמטה.
-- אם אין מספיק נתונים לתובנה אמיתית — כתוב "אין נתונים מספיקים לחיזוי" במקום להמציא."""
+פלט: רק Markdown בעברית. בלי הקדמה. בלי סיכום."""
 
-    prompt = f"""אתה אגרונום מומחה למערכות הידרופוניקה. הפק דוח קצר ומדויק.
+    # Tighten the rules when the cycle is too young for trend extrapolation
+    young_cycle_note = ''
+    if isinstance(days_into_cycle, int) and days_into_cycle < 4:
+        young_cycle_note = (
+            "\n\n=== הערה על המחזור ===\n"
+            f"המחזור צעיר ({days_into_cycle} ימים). אסור להמציא מגמת קצב — "
+            "השתמש בקטגוריות **[Agronomy]** או **[Stage]** עם עובדות מהקטלוג, "
+            "ובחלק התחזית כתוב במפורש שאין מספיק נתונים לחיזוי קצב."
+        )
 
-תאריך היום: {today_dmy} ({today_weekday_he}). אל תכתוב תאריך אחר.
-מחזור #{cycle_count}, יום {days_into_cycle} (החל {cycle_str}). אל תחשב מחדש.
-{plants_section}
-יעדים: pH {targets.get('ph_min')}-{targets.get('ph_max')} | EC {targets.get('ec_min')}-{targets.get('ec_max')} µS | טמפ׳ {targets.get('temp_min')}-{targets.get('temp_max')} °C
+    role = ("אתה אגרונום הידרופוניקה ותיק (20 שנות ניסיון) הכותב דוח יומי "
+            "למגדל בישראל שמשלם על המנוי. הדוח חייב לתת תובנה אגרונומית או "
+            "חיזוי שלא נראה באפליקציה — לא לחזור על מה שכבר מוצג שם.")
 
-{today_summary}
-{consumption_text}
-היסטוריה:
-{format_history_for_prompt(history_entries)}
+    retry_appendix = ''
+    if retry_hint:
+        retry_appendix = (
+            "\n\n=== תיקון מהניסיון הקודם ===\n"
+            f"הפלט הקודם שלך נכשל בבדיקה אוטומטית: {retry_hint}\n"
+            "תקן את הנקודה הזו בלבד. שמור על אותו מבנה."
+        )
 
-{style_instructions}
+    return '\n\n'.join([
+        role,
+        rules_block,
+        anchors_block,
+        plants_block,
+        targets_block,
+        readings_block,
+        history_block,
+        task_block,
+    ]) + young_cycle_note + retry_appendix
 
-חוקים:
-- התחל ישר במהות, ללא ברכות.
-- מספר הימים = {days_into_cycle}. התאריך = {today_dmy}. ללא המצאות.
-- אם מחזור צעיר (פחות מ-3 ימים) — ציין שאין מספיק נתונים לניתוח.
-- Markdown בעברית, כותרות ## והדגשות **. טבלאות בפורמט |---|."""
 
-    response = _gemini_generate_with_fallback(prompt)
-    return response.text
+def _first_failure_hint(validate_result):
+    """Pick the most useful failed-test reason to feed back to the LLM."""
+    if not validate_result:
+        return None
+    for name, ok, reason in validate_result['results']:
+        if not ok:
+            return f"{name} — {reason}"
+    return None
+
+
+def _degraded_report(today_dt, days_into_cycle, history_entries, report_style):
+    """Hand-written fallback when 3 LLM attempts all fail validation.
+    Better to ship a short honest message than a forbidden-pattern wall."""
+    today_dmy = today_dt.strftime('%d/%m/%Y')
+    today_metric = ''
+    if history_entries:
+        d, data = history_entries[-1]
+        today_metric = (f"pH {data.get('ph_avg', 0):.2f} | "
+                        f"EC {int(data.get('ec_avg', 0) or 0)} µS | "
+                        f"טמפ' {data.get('temp_avg', 0):.1f}°C")
+    if report_style == 'brief':
+        return (
+            f"## ℹ דוח קצר ({today_dmy})\n\n"
+            f"{today_metric}\n\n"
+            f"יום {days_into_cycle} למחזור.\n\n"
+            "**[Agronomy]**: לא הצלחנו להפיק תובנה אגרונומית איכותית להיום. "
+            "נחזור עם דוח מלא מחר.\n\n"
+            "**פעולה**: אין פעולה נדרשת היום.\n"
+        )
+    return (
+        f"## 1. סטטוס נוכחי\n\n{today_metric}\n\n"
+        "## 2. תובנות\n\n"
+        "**[Agronomy]**: לא הצלחנו להפיק תובנה אגרונומית איכותית להיום.\n\n"
+        "**[Stage]**: יום " + str(days_into_cycle) + " למחזור — נחזור עם דוח מלא מחר.\n\n"
+        "## 3. תחזית 3-5 ימים\n\n"
+        "אין תחזית להיום. הדוח יתחדש אוטומטית בריצה הבאה.\n\n"
+        "## 4. פעולות\n\n"
+        "אין פעולות נדרשות — קצב הצריכה תואם את הצפוי.\n"
+    )
+
+
+def generate_report(controller_id, settings, history_entries, cycle_start_dt,
+                    cycle_count, device_name=None, report_style='brief',
+                    today_dt=None):
+    """Generate a daily report with automated quality gates.
+
+    today_dt: optional override for the date anchor (test harness uses this
+              to simulate any day; production calls leave it None and we use
+              datetime.now())."""
+    today_dt = today_dt or datetime.now()
+    days_into_cycle = ((today_dt.date() - cycle_start_dt.date()).days
+                       if cycle_start_dt else 0)
+    today_iso = today_dt.strftime('%Y-%m-%d')
+    allowed_dates = _allowed_history_dates_set(history_entries)
+
+    retry_hint = None
+    last_md = None
+    last_validate = None
+    for attempt in range(1, _MAX_REGEN_ATTEMPTS + 1):
+        prompt = _build_prompt(
+            today_dt=today_dt,
+            cycle_start_dt=cycle_start_dt,
+            cycle_count=cycle_count,
+            days_into_cycle=days_into_cycle,
+            settings=settings if isinstance(settings, dict) else {},
+            history_entries=history_entries,
+            report_style=report_style,
+            retry_hint=retry_hint,
+        )
+        try:
+            response = _gemini_generate_with_fallback(prompt)
+            md = response.text
+        except Exception as e:
+            print(f"  [{controller_id}] generation attempt {attempt} raised: {e}")
+            continue
+
+        if _validate_run_all is None:
+            # Validators missing — ship whatever we got, log a warning.
+            print(f"  [{controller_id}] WARNING: validators unavailable, "
+                  "skipping quality gates.")
+            return md
+
+        validate = _validate_run_all(
+            md,
+            today_iso=today_iso,
+            style=report_style,
+            allowed_dates=allowed_dates,
+        )
+        last_md = md
+        last_validate = validate
+        if validate['overall_pass']:
+            print(f"  [{controller_id}] attempt {attempt}: PASS all 5 tests.")
+            return md
+        retry_hint = _first_failure_hint(validate)
+        print(f"  [{controller_id}] attempt {attempt}: FAIL — {retry_hint}")
+
+    # All attempts exhausted.
+    print(f"  [{controller_id}] ALL {_MAX_REGEN_ATTEMPTS} ATTEMPTS FAILED — "
+          "shipping degraded report.")
+    if last_md and last_validate:
+        # Optional: log full failure detail for debugging
+        for name, ok, reason in last_validate['results']:
+            if not ok:
+                print(f"    final fail: {name} — {reason}")
+    return _degraded_report(today_dt, days_into_cycle, history_entries, report_style)
 
 
 # V25.27: Multi-model fallback chain.
@@ -385,13 +645,18 @@ def generate_report(controller_id, settings, history_entries, cycle_start_dt, cy
 # Models in priority order:
 #   1. gemini-2.5-flash      — primary (best balance)
 #   2. gemini-2.0-flash      — different generation, separate capacity pool
-#   3. gemini-1.5-flash      — legacy, very stable, almost never busy
+#   3. gemini-2.5-flash-lite — cheaper sibling, separate quota bucket
+#
+# V25.30: gemini-1.5-flash was removed from the chain — Google deprecated it
+# from the v1beta endpoint (returns 404 NOT_FOUND for generateContent).
+# Replaced with gemini-2.5-flash-lite which is cheaper and shares the 2.5
+# family's prompt understanding so the same prompt works without re-tuning.
 #
 # Free-tier limits per model are independent, so this also TRIPLES our daily quota.
 _FALLBACK_MODEL_CHAIN = [
     'gemini-2.5-flash',
     'gemini-2.0-flash',
-    'gemini-1.5-flash',
+    'gemini-2.5-flash-lite',
 ]
 
 
@@ -432,9 +697,10 @@ def _gemini_generate_with_retry(prompt, model='gemini-2.5-flash', max_attempts=3
     delays = [5, 15, 30]  # seconds between attempts
 
     last_exc = None
+    gemini = _ensure_gemini()
     for attempt in range(max_attempts):
         try:
-            return client.models.generate_content(model=model, contents=prompt)
+            return gemini.models.generate_content(model=model, contents=prompt)
         except Exception as e:
             last_exc = e
             err_str = str(e)
@@ -707,6 +973,7 @@ def should_send_today(prefs, now_dt=None):
 
 
 def process_all_controllers():
+    _ensure_firebase()
     print("Fetching all controllers from Firebase...")
     all_controllers = db.reference('controllers').get() or {}
     if not all_controllers:
