@@ -20,41 +20,104 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-import firebase_admin
-from firebase_admin import credentials, db
-from google import genai
-import markdown
+# V25.30: heavy cloud SDKs imported lazily so the test harness can import
+# this module without requiring firebase-admin / google-genai on the local
+# machine. The production cron path (process_all_controllers) imports them
+# inside _ensure_firebase / _ensure_gemini before any external call.
+try:
+    import firebase_admin
+    from firebase_admin import credentials, db
+except ImportError:
+    firebase_admin = None  # type: ignore
+    credentials = None     # type: ignore
+    db = None              # type: ignore
 
-# ============ Plant data (mirror של plants.js – לתיאור בדוח Gemini) ============
-PLANT_NAMES_HE = {
-    'tomato': 'עגבנייה', 'cucumber': 'מלפפון', 'pepper': 'פלפל', 'lettuce': 'חסה',
-    'basil': 'בזיליקום', 'strawberry': 'תות שדה', 'kale': 'קייל', 'spinach': 'תרד',
-    'mint': 'נענע', 'parsley': 'פטרוזיליה', 'cilantro': 'כוסברה', 'chives': 'עירית',
-    'bok_choy': 'בוק צ\'וי', 'swiss_chard': 'מנגולד', 'arugula': 'אורוגולה',
-    'celery': 'סלרי', 'broccoli': 'ברוקולי', 'cauliflower': 'כרובית',
-    'eggplant': 'חציל', 'zucchini': 'קישוא', 'beans': 'שעועית', 'peas': 'אפונה',
-    'oregano': 'אורגנו', 'thyme': 'טימין', 'rosemary': 'רוזמרין', 'sage': 'מרווה',
-    'stevia': 'סטיביה', 'watercress': 'גרגיר הנחלים', 'dill': 'שמיר', 'mustard': 'חרדל'
-}
-STAGE_NAMES_HE = {
-    'seedling': 'סטרטר', 'vegetative': 'צמיחה', 'fruiting': 'פריחה/פרי',
-    'all': 'כל השלבים', 'vegfruit': 'צמיחה/פרי'
-}
+try:
+    from google import genai
+except ImportError:
+    genai = None  # type: ignore
+
+try:
+    import markdown
+except ImportError:
+    markdown = None  # type: ignore
+
+# ============ Plant catalog access (V25.30) ============
+# Previous PLANT_NAMES_HE was a hardcoded 30-entry dict — the LLM never saw
+# `notes_he`, `family_he`, `cycle_days`, or per-stage pH/EC targets, so
+# crop-specific insight was structurally impossible.
+#
+# `plants_catalog.py` (auto-generated from public/plants.js by
+# scripts/build_plants_catalog.py) gives full 54-species context. See briefing
+# §3.4 + §11.4 for the data we now surface to Gemini.
+try:
+    from plants_catalog import get_plant_context, PLANTS as _PLANTS_CATALOG
+except ImportError:
+    _PLANTS_CATALOG = {}
+    def get_plant_context(plant_id, stage_id=None):  # type: ignore[no-redef]
+        return None
 
 
-def format_plants_for_prompt(plants_list):
-    """ממיר רשימת צמחים מ-RTDB לטקסט קריא ל-Gemini."""
+def _short_plant_label(plants_list):
+    """Compact one-line label for header / chart caption. Falls back to id
+    when the plant is not in the catalog (shouldn't happen in normal use)."""
     if not plants_list:
         return None
     parts = []
     for p in plants_list:
         pid = p.get('id', '')
         qty = p.get('qty', 1)
-        stage = p.get('stage', '')
-        name = PLANT_NAMES_HE.get(pid, pid)
-        stage_he = STAGE_NAMES_HE.get(stage, stage)
-        parts.append(f"{name} ({stage_he}) ×{qty}")
-    return ", ".join(parts)
+        ctx = get_plant_context(pid, p.get('stage'))
+        name = (ctx['name_he'] if ctx else pid)
+        stage_label = (ctx['stage_label_he'] if ctx else p.get('stage', ''))
+        parts.append(f"{name} ({stage_label}) ×{qty}")
+    return ', '.join(parts)
+
+
+# Kept for backward compatibility with the existing email-send call site that
+# still asks for a plants_text label.
+def format_plants_for_prompt(plants_list):
+    return _short_plant_label(plants_list)
+
+
+def _build_plants_section(plants_list):
+    """Return the enriched per-plant block that goes into the LLM prompt.
+    Each plant gets: name_he, family_he, cycle_days, qty, stage label,
+    stage pH/EC targets, ec_critical, ph_critical, notes_he verbatim.
+    Returns a multi-line Hebrew string."""
+    if not plants_list:
+        return '(לא הוגדרו צמחים — דווח על המים כללית, ללא תובנות אגרונומיות ספציפיות.)'
+    lines = []
+    for p in plants_list:
+        pid = p.get('id', '')
+        qty = p.get('qty', 1)
+        stage_id = p.get('stage', 'all')
+        ctx = get_plant_context(pid, stage_id)
+        if not ctx:
+            # Unknown plant — give the model just the id so it doesn't bluff
+            lines.append(f"- {pid} ×{qty} (אין נתוני קטלוג — דווח רק על המדדים הגנריים).")
+            continue
+        ph_t = ctx['ph_target']
+        ec_t = ctx['ec_target']
+        ph_c = ctx['ph_critical']
+        ph_range = f"{ph_t[0]}-{ph_t[1]}" if ph_t else '?'
+        ec_range = f"{ec_t[0]}-{ec_t[1]}" if ec_t else '?'
+        ec_crit = ctx['ec_critical'] or '?'
+        ph_crit = f"{ph_c[0]}-{ph_c[1]}" if ph_c else '?'
+        lines.append(
+            f"- {ctx['name_he']} (משפחה: {ctx['family_he']}, מחזור טיפוסי: "
+            f"{ctx['cycle_days']} ימים), {qty} צמחים, שלב: {ctx['stage_label_he']}.\n"
+            f"    יעדים לשלב: pH {ph_range}, EC {ec_range} µS, EC קריטי {ec_crit} µS.\n"
+            f"    pH קריטי: {ph_crit}.\n"
+            f"    הערות אגרונומיות: {ctx['notes_he']}"
+        )
+    return '\n'.join(lines)
+
+
+def _allowed_history_dates_set(history_entries):
+    """Convert history list-of-tuples to a set of DD/MM strings for the
+    date-integrity validator."""
+    return {d.strftime('%d/%m') for d, _ in history_entries}
 
 
 def build_consumption_chart_url(history_entries, targets=None):
@@ -96,63 +159,114 @@ def build_consumption_chart_url(history_entries, targets=None):
         }
     ]
 
-    # Add target range bands as faint dashed lines if available
-    if ph_min is not None and ph_max is not None:
+    # Add target range bands as faint dashed lines if available.
+    # V25.30: only the upper bound gets a legend entry (single labeled trace
+    # per axis). The lower bound is suppressed from the legend by routing it
+    # to a "hidden" dataset technique — Chart.js v3 has no `filter:` string
+    # support in QuickChart (must be a real function), so we drop the legend
+    # filter and instead omit the redundant lower-bound trace from the legend
+    # by giving it `showLine=True` but no label, and setting
+    # `plugins.legend.labels.boxWidth=0` on the dataset via a workaround.
+    # Pragmatic choice: just skip the lower-bound trace entirely. The customer
+    # sees the upper "ceiling" dashed line which is the more useful guide
+    # (tip-burn and lockout are upper-bound failures).
+    if ph_max is not None:
         datasets.append({
-            "label": f"יעד pH ({ph_min}-{ph_max})", "data": [ph_max] * len(labels),
+            "label": f"תקרת pH ({ph_max})", "data": [ph_max] * len(labels),
             "borderColor": "rgba(59,130,246,0.35)", "borderDash": [4, 4],
             "borderWidth": 1, "pointRadius": 0, "yAxisID": "yPh", "fill": False
         })
+    if ec_max is not None:
         datasets.append({
-            "label": "", "data": [ph_min] * len(labels),
-            "borderColor": "rgba(59,130,246,0.35)", "borderDash": [4, 4],
-            "borderWidth": 1, "pointRadius": 0, "yAxisID": "yPh", "fill": False
-        })
-    if ec_min is not None and ec_max is not None:
-        datasets.append({
-            "label": f"יעד EC ({ec_min}-{ec_max})", "data": [ec_max] * len(labels),
-            "borderColor": "rgba(16,185,129,0.35)", "borderDash": [4, 4],
-            "borderWidth": 1, "pointRadius": 0, "yAxisID": "yEc", "fill": False
-        })
-        datasets.append({
-            "label": "", "data": [ec_min] * len(labels),
+            "label": f"תקרת EC ({ec_max} µS)", "data": [ec_max] * len(labels),
             "borderColor": "rgba(16,185,129,0.35)", "borderDash": [4, 4],
             "borderWidth": 1, "pointRadius": 0, "yAxisID": "yEc", "fill": False
         })
 
+    # V25.30: Chart.js v3+ schema — QuickChart upgraded and the old v2 syntax
+    # (yAxes array, scaleLabel, gridLines, legend.labels.filter as string)
+    # now returns HTTP 400. Equivalent v3 mapping:
+    #   yAxes: [{id:'yPh'}]            → scales: {yPh: {...}}
+    #   scaleLabel: {display, label}   → title: {display, text}
+    #   gridLines: {drawOnChartArea}   → grid: {drawOnChartArea}
+    #   top-level title / legend       → plugins.title / plugins.legend
     chart_config = {
         "type": "line",
         "data": {"labels": labels, "datasets": datasets},
         "options": {
-            "title": {"display": True, "text": "מגמת pH ו-EC לאורך המחזור", "fontSize": 16},
-            "legend": {"position": "bottom", "labels": {"filter": "function(item){return item.text!=='';}"}},
+            "plugins": {
+                "title": {"display": True, "text": "מגמת pH ו-EC לאורך המחזור",
+                          "font": {"size": 16}},
+                "legend": {"position": "bottom"}
+            },
             "scales": {
-                "yAxes": [
-                    {"id": "yPh", "position": "right", "scaleLabel": {"display": True, "labelString": "pH"},
-                     "ticks": {"min": 4, "max": 8, "stepSize": 0.5}, "gridLines": {"drawOnChartArea": False}},
-                    {"id": "yEc", "position": "left", "scaleLabel": {"display": True, "labelString": "EC (µS)"},
-                     "ticks": {"min": 0, "stepSize": 500}}
-                ],
-                "xAxes": [{"scaleLabel": {"display": True, "labelString": "תאריך"}}]
+                "yPh": {"position": "right",
+                        "title": {"display": True, "text": "pH"},
+                        "min": 4, "max": 8,
+                        "ticks": {"stepSize": 0.5},
+                        "grid": {"drawOnChartArea": False}},
+                "yEc": {"position": "left",
+                        "title": {"display": True, "text": "EC (µS)"},
+                        "min": 0,
+                        "ticks": {"stepSize": 500}},
+                "x": {"title": {"display": True, "text": "תאריך"}}
             }
         }
     }
+    # Each dataset's yAxisID also moves: in v3 the key matches scales keys.
+    for ds in datasets:
+        if ds.get("yAxisID") == "yPh":
+            ds["yAxisID"] = "yPh"
+        elif ds.get("yAxisID") == "yEc":
+            ds["yAxisID"] = "yEc"
     encoded = urllib.parse.quote(json.dumps(chart_config, ensure_ascii=False))
-    return f"https://quickchart.io/chart?c={encoded}&w=640&h=360&bkg=white"
+    return f"https://quickchart.io/chart?c={encoded}&w=640&h=360&bkg=white&v=4"
 
 # --- משתני סביבה (GitHub Actions secrets) ---
+# V25.30: lazy initialization — Firebase and Gemini clients are created on
+# first use, not at import. Lets the test harness in scripts/test_reports.py
+# import ai_manager without supplying Firebase credentials. The production
+# cron path (process_all_controllers) still calls _ensure_clients() before
+# any external calls.
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL")
 SENDER_EMAIL = os.getenv("GMAIL_USER")
 SENDER_PASSWORD = os.getenv("GMAIL_PASS")
-service_account_info = json.loads(os.getenv("FIREBASE_SERVICE_ACCOUNT"))
 
-print("Connecting to Firebase and Gemini...")
-cred = credentials.Certificate(service_account_info)
-if not firebase_admin._apps:
+client = None  # genai.Client — initialized lazily
+
+
+def _ensure_firebase():
+    """Initialize Firebase Admin once. Raises if FIREBASE_SERVICE_ACCOUNT is
+    missing — production runs always have it via GitHub Actions secrets."""
+    if firebase_admin is None:
+        raise RuntimeError("firebase-admin not installed; install with "
+                           "`pip install firebase-admin` for production use.")
+    if firebase_admin._apps:
+        return
+    raw = os.getenv("FIREBASE_SERVICE_ACCOUNT")
+    if not raw:
+        raise RuntimeError("FIREBASE_SERVICE_ACCOUNT env var is required")
+    print("Connecting to Firebase...")
+    cred = credentials.Certificate(json.loads(raw))
     firebase_admin.initialize_app(cred, {'databaseURL': DATABASE_URL})
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+
+def _ensure_gemini():
+    """Create the Gemini client on first call. Raises if GEMINI_API_KEY is
+    missing — caller decides how to surface that to the user."""
+    global client
+    if client is not None:
+        return client
+    if genai is None:
+        raise RuntimeError("google-genai not installed; install with "
+                           "`pip install google-genai` to run live reports.")
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY env var is required")
+    print("Connecting to Gemini...")
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    return client
+
 
 REPORT_TIERS = ('pro', 'pro_plus')
 
@@ -209,86 +323,317 @@ def format_history_for_prompt(entries):
     return "\n".join(lines)
 
 
-def generate_report(controller_id, settings, history_entries, cycle_start_dt, cycle_count, device_name=None, report_style='brief'):
-    # PWA v25: report_style מגיע מ-email_prefs של המשתמש: 'brief' | 'detailed' | 'agronomist'
-    style_pref = settings.get('ai_style', 'professional') if isinstance(settings, dict) else 'professional'
-    style_text = ('מקצועי, מדעי ואנליטי' if style_pref == 'professional'
-                  else 'קליל, ידידותי, ובגובה העיניים למגדל הביתי')
+# V25.30: Insight-driven report generator with automated quality gates.
+#
+# Why the rewrite (full context in REPORTS_AGENT_BRIEFING.md):
+# - The previous prompt was monolithic (~400 lines mixing role, rules,
+#   forbidden examples, insight examples, output template, all crammed into
+#   one f-string). The LLM prioritized the wrong sections.
+# - Plant context lost — only the plant name was passed. notes_he,
+#   family_he, cycle_days, per-stage targets, ec_critical never reached
+#   the model.
+# - No post-generation validation — reports with forbidden phrases shipped
+#   to customers anyway. Five iterations of prompt edits failed to fix
+#   this because the failure mode was structural, not textual.
+#
+# The new flow:
+#   1. Build a modular prompt: anchored date/cycle (Python-computed),
+#      enriched per-plant block (catalog-driven), targets context, history,
+#      style-specific output template demanding **[Category]** tags on
+#      every insight.
+#   2. Call _gemini_generate_with_fallback (3-model chain, unchanged).
+#   3. Run 5 quality validators from scripts/report_validators.py.
+#   4. On any test fail, regenerate with a targeted hint (max 3 attempts).
+#   5. If all attempts fail → return a hand-written degraded report
+#      ("no insights available today") rather than ship bad output.
+#
+# Validation runs are logged so we can track which tests fail most often
+# and tune the prompt over time.
+_MAX_REGEN_ATTEMPTS = 3
 
-    # שם ידידותי במקום MAC – או כינוי המשתמש או "המערכת שלך"
-    friendly_name = device_name if device_name else "המערכת"
+# Allow `from scripts.report_validators import ...` regardless of where the
+# script is invoked from. The Hydro-OTA deployment ships scripts/ alongside.
+import sys as _sys  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+_SCRIPTS_DIR = _Path(__file__).resolve().parent / 'scripts'
+if str(_SCRIPTS_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SCRIPTS_DIR))
+try:
+    from report_validators import run_all as _validate_run_all  # type: ignore
+except Exception:
+    _validate_run_all = None  # validators missing → skip gates, log a warning
 
-    targets = {
-        'temp_min': settings.get('temp_min', '?'), 'temp_max': settings.get('temp_max', '?'),
-        'ph_min': settings.get('ph_min', '?'), 'ph_max': settings.get('ph_max', '?'),
-        'ec_min': settings.get('ec_min', '?'), 'ec_max': settings.get('ec_max', '?'),
-    } if isinstance(settings, dict) else {}
 
-    cycle_str = cycle_start_dt.strftime('%d/%m/%Y') if cycle_start_dt else "לא הוגדר"
-    days_into_cycle = (datetime.now().date() - cycle_start_dt.date()).days if cycle_start_dt else "?"
+HEBREW_WEEKDAYS = ['שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת', 'ראשון']
 
-    # V25.24: Explicit date anchor — prevents Gemini from hallucinating dates
-    today_iso = datetime.now().strftime('%Y-%m-%d')      # 2026-06-07
-    today_dmy = datetime.now().strftime('%d/%m/%Y')      # 07/06/2026
-    today_weekday_he = ['שני','שלישי','רביעי','חמישי','שישי','שבת','ראשון'][datetime.now().weekday()]
 
-    today_summary = ""
+def _format_history_compact(entries, last_n=14):
+    """Last N days of history, one line per day. Saves tokens vs full cycle."""
+    if not entries:
+        return '(אין עדיין נתונים יומיים מאז תחילת המחזור)'
+    recent = entries[-last_n:]
+    lines = []
+    for d, data in recent:
+        ph = data.get('ph_avg', 0) or 0
+        ec = int(data.get('ec_avg', 0) or 0)
+        t = data.get('temp_avg', 0) or 0
+        lines.append(f"[{d.strftime('%d/%m')}] pH={ph:.2f}, EC={ec}, T={t:.1f}°C")
+    return '\n'.join(lines)
+
+
+def _build_prompt(*, today_dt, cycle_start_dt, cycle_count, days_into_cycle,
+                  settings, history_entries, report_style, retry_hint=None):
+    """Assemble the modular prompt. retry_hint is appended only on regeneration
+    attempts after a validation failure."""
+    today_iso = today_dt.strftime('%Y-%m-%d')
+    today_dmy = today_dt.strftime('%d/%m/%Y')
+    weekday_he = HEBREW_WEEKDAYS[today_dt.weekday()]
+    cycle_str = cycle_start_dt.strftime('%d/%m/%Y') if cycle_start_dt else 'לא הוגדר'
+
+    plants_list = settings.get('plants', []) if isinstance(settings, dict) else []
+    plants_section = _build_plants_section(plants_list)
+
+    targets_auto_or_manual = ('יעדים שהוגדרו ידנית על ידי המגדל '
+                              '(override של בחירת הצמח)'
+                              if settings.get('targets_manual_override')
+                              else 'יעדים אוטומטיים על-פי בחירת הצמח')
+
+    today_summary = ''
     if history_entries:
         d, data = history_entries[-1]
-        today_summary = (f"היום ({d.strftime('%d/%m/%Y')}): pH={data.get('ph_avg', 0):.2f}, "
-                         f"EC={data.get('ec_avg', 0):.0f}, Temp={data.get('temp_avg', 0):.1f}°C")
+        today_summary = (f"pH {data.get('ph_avg', 0):.2f} | "
+                         f"EC {int(data.get('ec_avg', 0) or 0)} µS | "
+                         f"טמפ' {data.get('temp_avg', 0):.1f}°C")
 
-    # V13.27+: מידע על הצמחים שגדלים – לדוח מותאם אישית
-    plants_list = settings.get('plants', []) if isinstance(settings, dict) else []
-    plants_text = format_plants_for_prompt(plants_list)
-    plants_section = f"\nצמחים בגידול נוכחי: {plants_text}\n" if plants_text else "\n(לא הוגדרו צמחים ספציפיים בהגדרות.)\n"
-
-    # סיכום צריכת חומרים מצטברת
     total_ph_sec = sum(int(d.get('ph_sec_total', 0) or 0) for _, d in history_entries)
     total_ec_sec = sum(int(d.get('ec_sec_total', 0) or 0) for _, d in history_entries)
-    consumption_text = f"\nצריכת חומרים מצטברת במחזור: חומצה pH – {total_ph_sec} שניות, דשן EC – {total_ec_sec} שניות.\n"
 
-    # V25.26: simplified to 2 styles — 'brief' (default) and 'agronomist' (PRO+).
-    # 'detailed' was removed: it caused walls of text + overlapped agronomist.
-    # Legacy 'detailed' preference falls through to 'agronomist'.
+    rules_block = """=== חוקים נוקשים ===
+אסור להשתמש בביטויים הבאים — המגדל רואה אותם באפליקציה:
+- "בטווח התקין" / "ערכים תקינים" / "מצב תקין"
+- "המערכת תקינה" / "המערכת פועלת כראוי"
+- "המשך בניטור" / "עקוב אחרי" / "מומלץ לבדוק"
+- "בדוק את תקינות החיישן" (ללא נימוק ספציפי מהנתונים)
+- "אמת את הרצף" / "הקפד על תיעוד"
+- "אולי" / "כדאי" (חסר החלטיות — אסור בפעולות)
+
+כל תובנה חייבת לפתוח בתג קטגוריה באחד מ-5 הסוגים, בדיוק בתבנית הזו:
+**[Trend]**: קצב שינוי מספרי + תאריך/ערך עתידי + פעולה
+**[Correlation]**: שני מדדים + עוצמת קשר + הסבר ביולוגי
+**[Stage]**: יום במחזור + שם הצמח + מאפיין השלב + אירוע צפוי
+**[Agronomy]**: שם הצמח + עובדה ספציפית + קשר לנתון הנוכחי
+**[Anomaly]**: תאריך ספציפי + ערך + הסבר סביר"""
+
+    anchors_block = f"""=== עוגני תאריך ומחזור ===
+תאריך היום: {today_dmy} ({weekday_he}, ISO {today_iso}).
+מחזור #{cycle_count}, יום {days_into_cycle} מתחילת המחזור (החל {cycle_str}).
+אל תחשב מחדש את היום. אל תמציא תאריך אחר."""
+
+    plants_block = f"""=== צמחים במחזור ===
+{plants_section}"""
+
+    targets_block = f"""=== יעדים נוכחיים ===
+pH {settings.get('ph_min', '?')}-{settings.get('ph_max', '?')} | EC {settings.get('ec_min', '?')}-{settings.get('ec_max', '?')} µS | טמפ׳ {settings.get('temp_min', '?')}-{settings.get('temp_max', '?')}°C
+({targets_auto_or_manual})"""
+
+    readings_block = f"""=== נתוני היום ===
+{today_summary if today_summary else '(אין עדיין מדידה יומית להיום)'}
+צריכה מצטברת במחזור: חומצה pH — {total_ph_sec} שניות, דשן EC — {total_ec_sec} שניות."""
+
+    history_block = f"""=== היסטוריה (עד 14 ימים אחרונים) ===
+{_format_history_compact(history_entries)}"""
+
     if report_style == 'brief':
-        style_instructions = """**סגנון: תקציר יומי (5-7 שורות).**
-מבנה:
-- שורה 1: כותרת ## עם סטטוס היום במשפט אחד (✓ הכל תקין / ⚠ pH חורג / וכו').
-- שורות 2-4: שורה לכל מדד (pH, EC, טמפ׳) — ערך + סטטוס בלבד.
-- שורות 5-7: התראה ופעולה — רק אם יש בעיה אמיתית. אם הכל תקין כתוב "אין מה לעשות היום".
-ללא טבלאות, ללא רשימות ארוכות."""
-    else:  # 'agronomist' (PRO+) — also catches legacy 'detailed'
-        style_instructions = """**סגנון: דוח אגרונומי מלא (PRO+).**
-מבנה (3 חלקים בלבד, סך הכל עד 25 שורות):
-1. **טבלת מצב** — שורה לכל מדד: היום | אתמול | ממוצע מחזור | יעד | סטטוס.
-2. **ניתוח קצר** — 2-3 משפטים על המגמה לאורך המחזור (לא להעתיק נתונים — להסיק).
-3. **המלצות פעולה** — עד 3 פריטים ממוספרים, כל אחד ב-2 שורות מקסימום:
-   נימוק (1 משפט) + פעולה ספציפית (1 משפט).
-חובה: ללא חזרות. ללא תיאור היסטוריה ארוכה. ללא הסברים תיאורטיים."""
+        task_block = """=== משימה ===
+סגנון: תקציר יומי. מבנה חובה (6-10 שורות בלבד):
 
-    prompt = f"""אתה אגרונום מומחה למערכות הידרופוניקה. הפק דוח קצר ומדויק.
+## ✓ או ⚠ + סיכום סטטוס במשפט אחד
+[שורה ריקה]
+pH: X.XX ← מילה אחת על המגמה (יציב/עולה/יורד)
+[שורה ריקה]
+EC: XXXX µS ← מילה אחת על המגמה
+[שורה ריקה]
+טמפ': XX.X°C ← מילה אחת על המגמה
+[שורה ריקה]
+**[Trend|Agronomy|Stage|Correlation|Anomaly]**: תובנה אחת מבוססת מספרים. עד 18 מילים.
+[שורה ריקה]
+**פעולה**: פעולה ספציפית עם מספר. אם באמת אין צורך — "אין פעולה נדרשת — קצב הצריכה תואם את הצפוי".
 
-תאריך היום: {today_dmy} ({today_weekday_he}). אל תכתוב תאריך אחר.
-מחזור #{cycle_count}, יום {days_into_cycle} (החל {cycle_str}). אל תחשב מחדש.
-{plants_section}
-יעדים: pH {targets.get('ph_min')}-{targets.get('ph_max')} | EC {targets.get('ec_min')}-{targets.get('ec_max')} µS | טמפ׳ {targets.get('temp_min')}-{targets.get('temp_max')} °C
+פלט: רק Markdown בעברית. בלי הקדמה. בלי סיכום מסביב."""
+    else:
+        task_block = """=== משימה ===
+סגנון: דוח אגרונומי. מבנה חובה — בדיוק 4 חלקים בסדר הזה:
 
-{today_summary}
-{consumption_text}
-היסטוריה:
-{format_history_for_prompt(history_entries)}
+## 1. סטטוס נוכחי
 
-{style_instructions}
+| מדד | היום | אתמול | יעד | סטטוס |
+|---|---|---|---|---|
+| pH | X.XX | X.XX | X.X-X.X | ✓ או ⚠ |
+| EC | XXXX | XXXX | XXXX-XXXX | ✓ או ⚠ |
+| טמפ' | XX.X | XX.X | XX-XX | ✓ או ⚠ |
 
-חוקים:
-- התחל ישר במהות, ללא ברכות.
-- מספר הימים = {days_into_cycle}. התאריך = {today_dmy}. ללא המצאות.
-- אם מחזור צעיר (פחות מ-3 ימים) — ציין שאין מספיק נתונים לניתוח.
-- Markdown בעברית, כותרות ## והדגשות **. טבלאות בפורמט |---|."""
+טבלה בלבד. בלי משפטים סביב.
 
-    response = _gemini_generate_with_fallback(prompt)
-    return response.text
+## 2. תובנות
+
+2-3 תובנות, **כל אחת בקטגוריה שונה**. כל תובנה במשפט אחד-שניים, מתחילה בתג:
+
+**[Trend]**: ...
+
+**[Correlation]**: ...
+
+**[Stage]** או **[Agronomy]** או **[Anomaly]**: ...
+
+## 3. תחזית 3-5 ימים
+
+1-2 משפטים. **כל משפט חייב לכלול תאריך ספציפי או מספר ימים**. בלי "אולי" ו"כדאי".
+
+## 4. פעולות
+
+1-3 פעולות. כל פעולה בשורה ממוספרת, מתחילה בפועל בציווי (הוסף / הפעל / הכן / בצע) + נימוק מספרי מהנתונים.
+אם אין צורך בפעולה — בשורה אחת: "אין פעולות נדרשות — קצב הצריכה תואם את הצפוי".
+
+פלט: רק Markdown בעברית. בלי הקדמה. בלי סיכום."""
+
+    # Tighten the rules when the cycle is too young for trend extrapolation
+    young_cycle_note = ''
+    if isinstance(days_into_cycle, int) and days_into_cycle < 4:
+        young_cycle_note = (
+            "\n\n=== הערה על המחזור ===\n"
+            f"המחזור צעיר ({days_into_cycle} ימים). אסור להמציא מגמת קצב — "
+            "השתמש בקטגוריות **[Agronomy]** או **[Stage]** עם עובדות מהקטלוג, "
+            "ובחלק התחזית כתוב במפורש שאין מספיק נתונים לחיזוי קצב."
+        )
+
+    role = ("אתה אגרונום הידרופוניקה ותיק (20 שנות ניסיון) הכותב דוח יומי "
+            "למגדל בישראל שמשלם על המנוי. הדוח חייב לתת תובנה אגרונומית או "
+            "חיזוי שלא נראה באפליקציה — לא לחזור על מה שכבר מוצג שם.")
+
+    retry_appendix = ''
+    if retry_hint:
+        retry_appendix = (
+            "\n\n=== תיקון מהניסיון הקודם ===\n"
+            f"הפלט הקודם שלך נכשל בבדיקה אוטומטית: {retry_hint}\n"
+            "תקן את הנקודה הזו בלבד. שמור על אותו מבנה."
+        )
+
+    return '\n\n'.join([
+        role,
+        rules_block,
+        anchors_block,
+        plants_block,
+        targets_block,
+        readings_block,
+        history_block,
+        task_block,
+    ]) + young_cycle_note + retry_appendix
+
+
+def _first_failure_hint(validate_result):
+    """Pick the most useful failed-test reason to feed back to the LLM."""
+    if not validate_result:
+        return None
+    for name, ok, reason in validate_result['results']:
+        if not ok:
+            return f"{name} — {reason}"
+    return None
+
+
+def _degraded_report(today_dt, days_into_cycle, history_entries, report_style):
+    """Hand-written fallback when 3 LLM attempts all fail validation.
+    Better to ship a short honest message than a forbidden-pattern wall."""
+    today_dmy = today_dt.strftime('%d/%m/%Y')
+    today_metric = ''
+    if history_entries:
+        d, data = history_entries[-1]
+        today_metric = (f"pH {data.get('ph_avg', 0):.2f} | "
+                        f"EC {int(data.get('ec_avg', 0) or 0)} µS | "
+                        f"טמפ' {data.get('temp_avg', 0):.1f}°C")
+    if report_style == 'brief':
+        return (
+            f"## ℹ דוח קצר ({today_dmy})\n\n"
+            f"{today_metric}\n\n"
+            f"יום {days_into_cycle} למחזור.\n\n"
+            "**[Agronomy]**: לא הצלחנו להפיק תובנה אגרונומית איכותית להיום. "
+            "נחזור עם דוח מלא מחר.\n\n"
+            "**פעולה**: אין פעולה נדרשת היום.\n"
+        )
+    return (
+        f"## 1. סטטוס נוכחי\n\n{today_metric}\n\n"
+        "## 2. תובנות\n\n"
+        "**[Agronomy]**: לא הצלחנו להפיק תובנה אגרונומית איכותית להיום.\n\n"
+        "**[Stage]**: יום " + str(days_into_cycle) + " למחזור — נחזור עם דוח מלא מחר.\n\n"
+        "## 3. תחזית 3-5 ימים\n\n"
+        "אין תחזית להיום. הדוח יתחדש אוטומטית בריצה הבאה.\n\n"
+        "## 4. פעולות\n\n"
+        "אין פעולות נדרשות — קצב הצריכה תואם את הצפוי.\n"
+    )
+
+
+def generate_report(controller_id, settings, history_entries, cycle_start_dt,
+                    cycle_count, device_name=None, report_style='brief',
+                    today_dt=None):
+    """Generate a daily report with automated quality gates.
+
+    today_dt: optional override for the date anchor (test harness uses this
+              to simulate any day; production calls leave it None and we use
+              datetime.now())."""
+    today_dt = today_dt or datetime.now()
+    days_into_cycle = ((today_dt.date() - cycle_start_dt.date()).days
+                       if cycle_start_dt else 0)
+    today_iso = today_dt.strftime('%Y-%m-%d')
+    allowed_dates = _allowed_history_dates_set(history_entries)
+
+    retry_hint = None
+    last_md = None
+    last_validate = None
+    for attempt in range(1, _MAX_REGEN_ATTEMPTS + 1):
+        prompt = _build_prompt(
+            today_dt=today_dt,
+            cycle_start_dt=cycle_start_dt,
+            cycle_count=cycle_count,
+            days_into_cycle=days_into_cycle,
+            settings=settings if isinstance(settings, dict) else {},
+            history_entries=history_entries,
+            report_style=report_style,
+            retry_hint=retry_hint,
+        )
+        try:
+            response = _gemini_generate_with_fallback(prompt)
+            md = response.text
+        except Exception as e:
+            print(f"  [{controller_id}] generation attempt {attempt} raised: {e}")
+            continue
+
+        if _validate_run_all is None:
+            # Validators missing — ship whatever we got, log a warning.
+            print(f"  [{controller_id}] WARNING: validators unavailable, "
+                  "skipping quality gates.")
+            return md
+
+        validate = _validate_run_all(
+            md,
+            today_iso=today_iso,
+            style=report_style,
+            allowed_dates=allowed_dates,
+        )
+        last_md = md
+        last_validate = validate
+        if validate['overall_pass']:
+            print(f"  [{controller_id}] attempt {attempt}: PASS all 5 tests.")
+            return md
+        retry_hint = _first_failure_hint(validate)
+        print(f"  [{controller_id}] attempt {attempt}: FAIL — {retry_hint}")
+
+    # All attempts exhausted.
+    print(f"  [{controller_id}] ALL {_MAX_REGEN_ATTEMPTS} ATTEMPTS FAILED — "
+          "shipping degraded report.")
+    if last_md and last_validate:
+        # Optional: log full failure detail for debugging
+        for name, ok, reason in last_validate['results']:
+            if not ok:
+                print(f"    final fail: {name} — {reason}")
+    return _degraded_report(today_dt, days_into_cycle, history_entries, report_style)
 
 
 # V25.27: Multi-model fallback chain.
@@ -300,13 +645,18 @@ def generate_report(controller_id, settings, history_entries, cycle_start_dt, cy
 # Models in priority order:
 #   1. gemini-2.5-flash      — primary (best balance)
 #   2. gemini-2.0-flash      — different generation, separate capacity pool
-#   3. gemini-1.5-flash      — legacy, very stable, almost never busy
+#   3. gemini-2.5-flash-lite — cheaper sibling, separate quota bucket
+#
+# V25.30: gemini-1.5-flash was removed from the chain — Google deprecated it
+# from the v1beta endpoint (returns 404 NOT_FOUND for generateContent).
+# Replaced with gemini-2.5-flash-lite which is cheaper and shares the 2.5
+# family's prompt understanding so the same prompt works without re-tuning.
 #
 # Free-tier limits per model are independent, so this also TRIPLES our daily quota.
 _FALLBACK_MODEL_CHAIN = [
     'gemini-2.5-flash',
     'gemini-2.0-flash',
-    'gemini-1.5-flash',
+    'gemini-2.5-flash-lite',
 ]
 
 
@@ -347,9 +697,10 @@ def _gemini_generate_with_retry(prompt, model='gemini-2.5-flash', max_attempts=3
     delays = [5, 15, 30]  # seconds between attempts
 
     last_exc = None
+    gemini = _ensure_gemini()
     for attempt in range(max_attempts):
         try:
-            return client.models.generate_content(model=model, contents=prompt)
+            return gemini.models.generate_content(model=model, contents=prompt)
         except Exception as e:
             last_exc = e
             err_str = str(e)
@@ -367,39 +718,121 @@ def _gemini_generate_with_retry(prompt, model='gemini-2.5-flash', max_attempts=3
     raise last_exc if last_exc else RuntimeError("Retry loop exited unexpectedly")
 
 
-def _add_sentence_breaks(md_text):
-    """V25.27: insert a Markdown line break (two spaces + \\n) after every period or colon
-    that ends a sentence in a paragraph. Skips lines that are tables, lists, or headings.
-    Effect: when rendered, each sentence sits on its own line — no long walls of text.
+def _split_sentences_to_paragraphs(md_text):
+    """V25.28: split each line containing multiple sentences into separate paragraphs.
+    Sentence boundary: '.', '!', '?' or ':' followed by space + Hebrew/Latin letter.
+    Avoids splitting decimals like '1.5' (lookbehind requires non-digit).
+    Skips tables, headings, list items, code blocks.
+    Output: each sentence on its own line, with blank line between → renders as
+    separate <p> tags in Markdown.
     """
     import re
-    out_lines = []
+    out_blocks = []
     for line in md_text.split('\n'):
         stripped = line.lstrip()
-        # Skip non-paragraph lines (tables, headings, list items, blank)
+        # Skip non-paragraph lines
         if (not stripped or stripped.startswith('|') or stripped.startswith('#') or
                 stripped.startswith('- ') or stripped.startswith('* ') or
-                re.match(r'^\d+\.\s', stripped) or
-                re.match(r'^\s*\|', line)):
-            out_lines.append(line)
+                stripped.startswith('```') or
+                re.match(r'^\d+\.\s', stripped)):
+            out_blocks.append(line)
             continue
-        # Insert "  \n" after period/colon followed by space + Hebrew/Latin letter
-        # Avoid breaking inside numbers (e.g. 1.5, 25.23) — the lookbehind excludes digits
-        line = re.sub(
-            r'(?<=[א-תa-zA-Z\)\]])([\.\:])\s+(?=[א-תA-Z])',
-            r'\1  \n',
+        # Split at sentence boundaries
+        # Pattern: (non-digit char)(. or : or ! or ?)(space)(Hebrew or uppercase Latin letter)
+        sentences = re.split(
+            r'(?<=[א-תa-zA-Z\)\]])([\.\:\!\?])\s+(?=[א-תA-Z])',
             line
         )
-        out_lines.append(line)
-    return '\n'.join(out_lines)
+        # Re-join keeping the delimiters
+        if len(sentences) <= 1:
+            out_blocks.append(line)
+            continue
+        result = []
+        for i in range(0, len(sentences), 2):
+            sent = sentences[i]
+            delim = sentences[i+1] if i+1 < len(sentences) else ''
+            full = sent + delim
+            if full.strip():
+                result.append(full.strip())
+        # Each sentence becomes its own paragraph (blank line between)
+        out_blocks.append('\n\n'.join(result))
+    return '\n'.join(out_blocks)
+
+
+def _polish_html_for_email(html):
+    """V25.28: post-process Markdown-rendered HTML to bulletproof email-client display.
+    - Force every <table> to width=584, table-layout:fixed, border-collapse:collapse
+    - Add explicit max-width on <p> and <li>
+    - Wrap loose text after periods with <br> (defensive — should already be split)
+    """
+    import re
+    # Force tables to behave inside the 640px container
+    html = re.sub(
+        r'<table>',
+        '<table width="584" cellpadding="6" cellspacing="0" border="0" style="width:584px;max-width:584px;border-collapse:collapse;table-layout:fixed;background:#fafafa;border:1px solid #e5e7eb;border-radius:8px;margin:12px 0;">',
+        html
+    )
+    html = re.sub(
+        r'<th>',
+        '<th style="background:#ede9fe;color:#5b21b6;padding:10px 8px;text-align:right;font-weight:700;font-size:13px;border-bottom:2px solid #ddd6fe;word-wrap:break-word;">',
+        html
+    )
+    html = re.sub(
+        r'<td>',
+        '<td style="padding:10px 8px;text-align:right;font-size:13px;border-bottom:1px solid #e5e7eb;word-wrap:break-word;vertical-align:top;">',
+        html
+    )
+    # Make headings prominent
+    html = re.sub(
+        r'<h2>',
+        '<h2 style="color:#6d28d9;font-size:18px;font-weight:700;margin:24px 0 12px 0;padding:8px 12px;background:#f5f3ff;border-right:4px solid #6d28d9;border-radius:6px;">',
+        html
+    )
+    html = re.sub(
+        r'<h3>',
+        '<h3 style="color:#374151;font-size:15px;font-weight:700;margin:16px 0 8px 0;">',
+        html
+    )
+    # Paragraphs: explicit width + line height + spacing
+    html = re.sub(
+        r'<p>',
+        '<p style="margin:8px 0;font-size:14px;line-height:1.7;color:#1f2937;max-width:584px;">',
+        html
+    )
+    # List items: card style + numbered badges
+    html = re.sub(
+        r'<ol>',
+        '<ol style="padding:0;margin:14px 0;list-style:none;counter-reset:rec;">',
+        html
+    )
+    html = re.sub(
+        r'<ul>',
+        '<ul style="padding:0;margin:14px 0;list-style:none;">',
+        html
+    )
+    html = re.sub(
+        r'<li>',
+        '<li style="background:#f9fafb;border-right:3px solid #8b5cf6;border-radius:6px;padding:12px 16px;margin:8px 0;font-size:14px;line-height:1.7;color:#1f2937;max-width:584px;">',
+        html
+    )
+    # Strong: brand color
+    html = re.sub(
+        r'<strong>',
+        '<strong style="color:#5b21b6;font-weight:700;">',
+        html
+    )
+    return html
 
 
 def send_report_email(client_email, controller_id, report_md, cycle_count, days_into_cycle, chart_url=None, plants_text=None, device_name=None):
-    # V25.27: break long paragraphs into sentence-per-line BEFORE rendering Markdown
-    report_md = _add_sentence_breaks(report_md)
-    # V25.24: extensions=['tables','nl2br'] — renders Markdown pipe-tables as real <table>
-    # and converts single newlines to <br> for better paragraph spacing.
-    html_body = markdown.markdown(report_md, extensions=['tables', 'nl2br'])
+    # V25.28: aggressive sentence-splitting + HTML inline-styling.
+    # Step 1: split multi-sentence paragraphs into separate Markdown paragraphs.
+    report_md = _split_sentences_to_paragraphs(report_md)
+    # Step 2: convert Markdown to HTML. tables=Markdown tables, nl2br=NOT here
+    #         (we use \n\n paragraph breaks instead, more reliable).
+    html_body = markdown.markdown(report_md, extensions=['tables'])
+    # Step 3: inject inline styles on EVERY tag because Outlook ignores <style> tags
+    html_body = _polish_html_for_email(html_body)
     friendly_name = device_name if device_name else "SmartHydro"
     # V25.25: email-client-safe chart row (table-based, not div)
     chart_html = ""
@@ -431,73 +864,54 @@ def send_report_email(client_email, controller_id, report_md, cycle_count, days_
           </td>
         </tr>"""
 
-    # V25.27: HARD-LOCKED 640px width. Every element gets explicit width.
-    # No percentages, no max-width on container, no responsive behavior.
-    # If user opens on mobile they'll see horizontal scroll — acceptable tradeoff
-    # for guaranteed Outlook desktop behavior.
-    body_styles = """
-    <style>
-      .report-content { font-family: 'Heebo','Segoe UI',Arial,sans-serif; color:#1f2937; font-size:14px; line-height:1.7; }
-      .report-content h2 { color:#6d28d9; font-size:17px; font-weight:700; margin:20px 0 8px 0; padding-bottom:5px; border-bottom:2px solid #ede9fe; }
-      .report-content h3 { color:#374151; font-size:14px; font-weight:700; margin:14px 0 6px 0; }
-      .report-content p { margin:6px 0; }
-      .report-content strong { color:#5b21b6; font-weight:700; }
-      .report-content em { color:#6b7280; font-style:normal; font-size:12px; }
-      .report-content table { border-collapse:collapse; width:584px; max-width:584px; margin:10px 0; background:#fafafa; border-radius:8px; table-layout:fixed; }
-      .report-content th { background:#ede9fe; color:#5b21b6; padding:8px 6px; text-align:right; font-weight:700; font-size:12px; border-bottom:2px solid #ddd6fe; word-wrap:break-word; }
-      .report-content td { padding:8px 6px; text-align:right; font-size:12px; border-bottom:1px solid #e5e7eb; word-wrap:break-word; vertical-align:top; }
-      .report-content tr:last-child td { border-bottom:none; }
-      .report-content ol, .report-content ul { padding-right:0; padding-left:0; margin:10px 0; list-style:none; counter-reset:rec-counter; }
-      .report-content ol li, .report-content ul li {
-        background:#f9fafb; border-right:3px solid #8b5cf6; border-radius:6px;
-        padding:10px 14px; margin:6px 0; font-size:13px; line-height:1.6; position:relative; word-wrap:break-word;
-      }
-      .report-content ol li { counter-increment:rec-counter; padding-right:44px; }
-      .report-content ol li:before {
-        content:counter(rec-counter); position:absolute; right:12px; top:10px;
-        background:#8b5cf6; color:#fff; width:22px; height:22px; border-radius:50%;
-        text-align:center; line-height:22px; font-size:12px; font-weight:700;
-      }
-      .report-content hr { border:none; border-top:1px solid #e5e7eb; margin:14px 0; }
-      .report-content code { background:#f3f4f6; color:#5b21b6; padding:1px 5px; border-radius:4px; font-family:monospace; font-size:12px; }
-    </style>"""
-
-    # V25.27: Single 640px-wide table, centered via margin auto. No outer 100% wrapper.
-    # This is the Mailchimp-style minimal frame that Outlook ALWAYS respects.
+    # V25.28: Two-layer wrapper (industry standard for email).
+    # Layer 1: 100%-wide table with light-gray background (visible "page" around content)
+    # Layer 2: 640px-wide content table centered inside, with visible frame
+    # ALL inline styles — no <style> tag, no @media. Outlook respects this 100%.
     html_template = f"""<!DOCTYPE html>
 <html lang="he" dir="rtl">
 <head>
 <meta charset="UTF-8">
 <title>דוח אגרונומי</title>
-{body_styles}
 </head>
-<body style="margin:0;padding:20px 0;background-color:#f3f4f6;font-family:'Heebo','Segoe UI',Arial,sans-serif;direction:rtl;">
+<body style="margin:0;padding:0;background-color:#e5e7eb;font-family:'Heebo','Segoe UI',Arial,sans-serif;direction:rtl;">
 
-  <table align="center" cellpadding="0" cellspacing="0" border="0" width="640" style="width:640px;margin:0 auto;background-color:#ffffff;border:1px solid #d1d5db;border-radius:14px;border-collapse:separate;">
-
-    <!-- Header -->
+  <!-- Layer 1: outer 100% width with page background -->
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#e5e7eb" style="background-color:#e5e7eb;">
     <tr>
-      <td width="640" bgcolor="#6d28d9" style="width:640px;background-color:#6d28d9;background-image:linear-gradient(135deg,#8b5cf6,#6d28d9);color:#ffffff;padding:24px;text-align:center;border-radius:14px 14px 0 0;">
-        <div style="font-size:21px;font-weight:700;margin-bottom:4px;color:#ffffff;">דוח אגרונומי יומי</div>
-        <div style="font-size:12px;color:#ffffff;opacity:0.95;">{friendly_name} &middot; מחזור #{cycle_count} &middot; יום {days_into_cycle}</div>
-      </td>
-    </tr>
+      <td align="center" valign="top" style="padding:20px 10px;">
 
-    {plants_html_row}
+        <!-- Layer 2: 640px content with visible frame -->
+        <table align="center" cellpadding="0" cellspacing="0" border="0" width="640" style="width:640px;max-width:640px;background-color:#ffffff;border:2px solid #6d28d9;border-radius:12px;">
 
-    <!-- Content cell — hard 640 minus 48 padding = 592 content area -->
-    <tr>
-      <td class="report-content" width="640" style="width:640px;padding:22px 24px;font-family:'Heebo','Segoe UI',Arial,sans-serif;color:#1f2937;font-size:14px;line-height:1.7;text-align:right;direction:rtl;word-break:break-word;">
-        {html_body}
-      </td>
-    </tr>
+          <!-- Header (centered, prominent) -->
+          <tr>
+            <td width="640" bgcolor="#6d28d9" style="width:640px;background-color:#6d28d9;color:#ffffff;padding:20px;text-align:center;">
+              <div style="font-size:20px;font-weight:700;color:#ffffff;margin-bottom:6px;">📊 דוח אגרונומי יומי</div>
+              <div style="font-size:13px;color:#ffffff;">{friendly_name}</div>
+              <div style="font-size:12px;color:#ddd6fe;margin-top:4px;">מחזור #{cycle_count} &middot; יום {days_into_cycle}</div>
+            </td>
+          </tr>
 
-    {chart_html}
+          {plants_html_row}
 
-    <!-- Footer -->
-    <tr>
-      <td width="640" bgcolor="#f8fafc" style="width:640px;background-color:#f8fafc;padding:12px;text-align:center;font-size:10px;color:#6b7280;border-radius:0 0 14px 14px;">
-        &copy; 2026 SmartHydro Systems
+          <!-- Content -->
+          <tr>
+            <td width="640" style="width:640px;padding:20px 24px;font-family:'Heebo','Segoe UI',Arial,sans-serif;color:#1f2937;font-size:14px;line-height:1.75;text-align:right;direction:rtl;word-break:break-word;">
+              {html_body}
+            </td>
+          </tr>
+
+          {chart_html}
+
+          <!-- Footer -->
+          <tr>
+            <td width="640" bgcolor="#f5f3ff" style="width:640px;background-color:#f5f3ff;padding:14px;text-align:center;font-size:11px;color:#6d28d9;border-top:1px solid #ddd6fe;">
+              &copy; 2026 SmartHydro Systems
+            </td>
+          </tr>
+        </table>
+
       </td>
     </tr>
   </table>
@@ -559,6 +973,7 @@ def should_send_today(prefs, now_dt=None):
 
 
 def process_all_controllers():
+    _ensure_firebase()
     print("Fetching all controllers from Firebase...")
     all_controllers = db.reference('controllers').get() or {}
     if not all_controllers:
