@@ -153,6 +153,7 @@ def mark_alert_email_sent(mac: str, level: int):
 def send_tiered_alert_email(to_email: str, mac: str, device_name: str, level: int,
                             ph=None, ec=None, temp=None,
                             ph_min=None, ph_max=None, ec_min=None, ec_max=None,
+                            t_min=None, t_max=None,
                             alert_since_sec=0):
     """V14.0: שולח מייל התראה מדורג — Warning (level 2) או Critical (level 3)."""
     if not SENDER_EMAIL or not SENDER_PASSWORD or not to_email:
@@ -172,8 +173,9 @@ def send_tiered_alert_email(to_email: str, mac: str, device_name: str, level: in
     if ec is not None and ec_min is not None and ec_max is not None:
         if ec < ec_min or ec > ec_max:
             issues.append(f"EC = {int(ec)} µS (טווח תקין: {int(ec_min)}-{int(ec_max)})")
-    if temp is not None:
-        issues.append(f"טמפרטורה = {temp:.1f}°C")
+    if temp is not None and t_min is not None and t_max is not None:
+        if temp < t_min or temp > t_max:
+            issues.append(f"טמפרטורה = {temp:.1f}°C (טווח תקין: {t_min}-{t_max})")
     if not issues:
         issues.append("חריגה מטווחי היעד")
 
@@ -182,10 +184,21 @@ def send_tiered_alert_email(to_email: str, mac: str, device_name: str, level: in
 
     critical_box = ""
     if is_critical:
-        critical_box = """
+        # V25.40: זיהוי דינמי של מה הפעיל את החריגה (במקום טקסט hardcoded)
+        trigger_parts = []
+        for i in issues:
+            if i.startswith("pH"):
+                trigger_parts.append("pH")
+            elif i.startswith("EC"):
+                trigger_parts.append("EC")
+            elif i.startswith("טמפרטורה"):
+                trigger_parts.append("טמפרטורה")
+        trigger_parts = list(dict.fromkeys(trigger_parts))
+        triggers_he = " / ".join(trigger_parts) if trigger_parts else "ערכי המערכת"
+        critical_box = f"""
         <div style="background:#fef2f2;border-right:4px solid #dc2626;padding:15px;border-radius:8px;margin:20px 0;">
           <h3 style="margin:0 0 10px 0;color:#991b1b;">⚡ פעולה נדרשת מיידית</h3>
-          <p style="margin:0;color:#7f1d1d;">ערכי pH/EC חרגו מסף הנזק. בדוק את המערכת בהקדם — ייתכן נזק לצמחים.</p>
+          <p style="margin:0;color:#7f1d1d;">ערכי {triggers_he} חרגו מסף הנזק. בדוק את המערכת בהקדם — ייתכן נזק לצמחים.</p>
         </div>"""
 
     html = f"""<!DOCTYPE html>
@@ -328,24 +341,35 @@ def evaluate_controller(mac: str, cdata: dict):
             try_send("water_low", f"מפלס מים נמוך מאוד ({pct:.0f}%). מלא את המאגר.")
 
     # 7. V14.0: Tiered alert email — מייל מדורג לפי alert_level מהקושחה
-    fw_alert_level = status.get("alert_level", 0)
-    fw_alert_since = status.get("alert_since", 0)  # שניות מאז תחילת החריגה
-    if isinstance(fw_alert_level, (int, float)) and fw_alert_level >= 2:
-        fw_alert_level = int(fw_alert_level)
-        # Level 3 עוקף quiet hours; Level 2 מכבד
-        if fw_alert_level >= 3 or not in_quiet:
-            owner_email = cdata.get("owner_email") or ""
-            if owner_email and can_send_alert_email(mac, fw_alert_level):
-                sent = send_tiered_alert_email(
-                    to_email=owner_email, mac=mac, device_name=device_name,
-                    level=fw_alert_level,
-                    ph=ph, ec=ec, temp=temp,
-                    ph_min=ph_min, ph_max=ph_max,
-                    ec_min=ec_min, ec_max=ec_max,
-                    alert_since_sec=int(fw_alert_since) if fw_alert_since else 0
-                )
-                if sent:
-                    mark_alert_email_sent(mac, fw_alert_level)
+    # v2026-06-20: גארד טריות — אם הבקר offline, ה-alert_level הוא זומבי. אל תשלח.
+    controller_stale = (
+        not last_update or
+        (now_ts() - int(last_update)) > OFFLINE_THRESHOLD_SEC
+    )
+    if controller_stale:
+        fw_alert_level = status.get("alert_level", 0)
+        age = (now_ts() - int(last_update)) if last_update else -1
+        print(f"  [tiered-skip] {mac}: controller stale (last_update {age}s ago), alert_level frozen at {fw_alert_level}")
+    else:
+        fw_alert_level = status.get("alert_level", 0)
+        fw_alert_since = status.get("alert_since", 0)  # שניות מאז תחילת החריגה
+        if isinstance(fw_alert_level, (int, float)) and fw_alert_level >= 2:
+            fw_alert_level = int(fw_alert_level)
+            # Level 3 עוקף quiet hours; Level 2 מכבד
+            if fw_alert_level >= 3 or not in_quiet:
+                owner_email = cdata.get("owner_email") or ""
+                if owner_email and can_send_alert_email(mac, fw_alert_level):
+                    sent = send_tiered_alert_email(
+                        to_email=owner_email, mac=mac, device_name=device_name,
+                        level=fw_alert_level,
+                        ph=ph, ec=ec, temp=temp,
+                        ph_min=ph_min, ph_max=ph_max,
+                        ec_min=ec_min, ec_max=ec_max,
+                        t_min=t_min, t_max=t_max,
+                        alert_since_sec=int(fw_alert_since) if fw_alert_since else 0
+                    )
+                    if sent:
+                        mark_alert_email_sent(mac, fw_alert_level)
 
 
 def send_feedback_email(entry_id: str, entry: dict):
