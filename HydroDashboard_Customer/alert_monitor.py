@@ -35,6 +35,13 @@ IST_OFFSET = 3  # IDT (קיץ). חורף = 2. לצורך MVP – ניקח 3.
 CRITICAL_ALERTS = {"pump_lock", "controller_offline"}  # תמיד נשלחות גם בשעות שקט
 TIER_ALLOWED = ("pro", "pro_plus")
 
+# v2026-06-21: שתי שכבות ניטור חדשות — ריבוטים תכופים + WiFi חלש
+REBOOT_RATE_WINDOW_SEC = 3600       # שעה
+REBOOT_RATE_THRESHOLD  = 3          # 3+ ריבוטים בשעה = בעיה
+WEAK_WIFI_THRESHOLD_DBM = -80       # מתחת לזה = חלש
+WEAK_WIFI_DURATION_SEC  = 3600      # שעה ברצף מתחת לסף לפני התראה
+WEAK_WIFI_COOLDOWN_SEC  = 6 * 3600  # cooldown ייעודי — מצב slow-burn, לא רוצים spam
+
 # הגדרות שליחת משוב
 FEEDBACK_TO_EMAIL = "smarthydro.il@gmail.com"
 SENDER_EMAIL = os.getenv("GMAIL_USER")
@@ -129,8 +136,19 @@ def alert_label(alert_type: str) -> str:
         "sensor_offline":     "🟠 חיישן לא מגיב",
         "ph_ec_out":          "🟠 pH/EC חורג מהטווח",
         "temp_out":           "🟡 טמפרטורה חורגת",
-        "water_low":          "🟠 מפלס מים נמוך"
+        "water_low":          "🟠 מפלס מים נמוך",
+        "reboot_rate":        "🔁 ריבוטים תכופים",
+        "weak_wifi":          "📶 WiFi חלש"
     }.get(alert_type, alert_type)
+
+
+def can_send_weak_wifi(uid: str, mac: str) -> bool:
+    """Cooldown ייעודי ל-weak_wifi — 6h במקום שעה רגילה (slow-burn)."""
+    path = f"users/{uid}/alert_state/{mac}/weak_wifi/last_sent"
+    last = db.reference(path).get()
+    if not last:
+        return True
+    return (now_ts() - int(last)) >= WEAK_WIFI_COOLDOWN_SEC
 
 
 def can_send_alert_email(mac: str, level: int) -> bool:
@@ -281,7 +299,9 @@ def evaluate_controller(mac: str, cdata: dict):
             "sensor_offline": "sensor",
             "ph_ec_out": "ph_ec",
             "temp_out": "temp",
-            "water_low": "water_low"
+            "water_low": "water_low",
+            "reboot_rate": "reboot_rate",
+            "weak_wifi": "weak_wifi"
         }[alert_type]
         if alert_type not in CRITICAL_ALERTS and prefs.get(pref_key) is False:
             return
@@ -340,12 +360,96 @@ def evaluate_controller(mac: str, cdata: dict):
         if pct < WATER_LOW_PCT:
             try_send("water_low", f"מפלס מים נמוך מאוד ({pct:.0f}%). מלא את המאגר.")
 
-    # 7. V14.0: Tiered alert email — מייל מדורג לפי alert_level מהקושחה
-    # v2026-06-20: גארד טריות — אם הבקר offline, ה-alert_level הוא זומבי. אל תשלח.
+    # v2026-06-20: גארד טריות משותף — אם הבקר offline, מדלגים על reboot_rate / weak_wifi / tiered.
+    # controller_offline (סעיף 2) כבר כיסה את המקרה — אל תכפיל התראה.
     controller_stale = (
         not last_update or
         (now_ts() - int(last_update)) > OFFLINE_THRESHOLD_SEC
     )
+
+    # 7. v2026-06-21: Reboot-rate — מספר ריבוטים בשעה האחרונה ≥ סף
+    if controller_stale:
+        print(f"  [reboot-rate-skip] {mac}: controller stale, skipping reboot_rate")
+    else:
+        reboot_log = cdata.get("reboot_log") or {}
+        if isinstance(reboot_log, dict) and reboot_log:
+            cutoff = now_ts() - REBOOT_RATE_WINDOW_SEC
+            recent_reboots = []
+            for epoch_key, entry in reboot_log.items():
+                try:
+                    epoch_val = int(epoch_key)
+                except (ValueError, TypeError):
+                    continue
+                if epoch_val >= cutoff and isinstance(entry, dict):
+                    recent_reboots.append(entry)
+            if len(recent_reboots) >= REBOOT_RATE_THRESHOLD:
+                # סיבות אחרונות (dedup, שמירה על סדר)
+                reasons = []
+                for r in recent_reboots:
+                    reason = r.get("reason") or r.get("cause") or "unknown"
+                    if reason not in reasons:
+                        reasons.append(str(reason))
+                reasons_he = ", ".join(reasons) if reasons else "לא ידוע"
+                body = (
+                    f"הבקר אותחל {len(recent_reboots)} פעמים בשעה האחרונה.\n"
+                    f"סיבות אחרונות: {reasons_he}.\n"
+                    f"כשהריבוטים תכופים — סנסורים לא נקראים, אוטומציה לא רצה, "
+                    f"וכל אירוע מאבד ~60 שניות.\n"
+                    f"בדוק WiFi (במיוחד RSSI) או צור קשר עם התמיכה."
+                )
+                try_send("reboot_rate", body, "warning")
+
+    # 8. v2026-06-21: Weak-WiFi — RSSI מתחת לסף שעה ברצף
+    if controller_stale:
+        print(f"  [weak-wifi-skip] {mac}: controller stale, skipping weak_wifi")
+    else:
+        wifi_rssi = rt.get("wifi_rssi")
+        # weak_wifi_since מנוהל ב-alert_email_state כדי להישאר עקבי עם ה-state האחר של הבקר
+        state_ref = db.reference(f"controllers/{mac}/alert_email_state")
+        weak_since = None
+        try:
+            weak_since = state_ref.child("weak_wifi_since").get()
+        except Exception as e:
+            print(f"  [weak-wifi-state-err] {mac}: {e}")
+        if isinstance(wifi_rssi, (int, float)):
+            if wifi_rssi < WEAK_WIFI_THRESHOLD_DBM:
+                # תחת הסף — אם זו תחילת הירידה, רשום ts; אחרת בדוק משך
+                if not weak_since:
+                    try:
+                        state_ref.update({"weak_wifi_since": now_ts()})
+                        print(f"  [weak-wifi-start] {mac}: rssi={wifi_rssi} dBm, marking start")
+                    except Exception as e:
+                        print(f"  [weak-wifi-mark-err] {mac}: {e}")
+                else:
+                    duration = now_ts() - int(weak_since)
+                    if duration >= WEAK_WIFI_DURATION_SEC:
+                        # cooldown ייעודי — לא דרך can_send אלא can_send_weak_wifi
+                        if (uid and tokens
+                                and (not in_quiet or "weak_wifi" in CRITICAL_ALERTS)
+                                and prefs.get("notif_weak_wifi") is not False
+                                and can_send_weak_wifi(uid, mac)):
+                            body = (
+                                f"WiFi חלש מעל שעה: {int(wifi_rssi)} dBm (סף תקין: -65 ומעלה).\n"
+                                f"בקרים עם WiFi חלש נוטים לחווה ריבוטים תכופים "
+                                f"ולאבד תקשורת עם הענן.\n"
+                                f"המלצה: העבר את הראוטר קרוב יותר, או הוסף Mesh / Extender."
+                            )
+                            title = f"{alert_label('weak_wifi')} – {device_name}"
+                            push_to_user(tokens, title, body, "weak_wifi", "warning", mac)
+                            mark_sent(uid, mac, "weak_wifi")
+                        else:
+                            print(f"  [weak-wifi-skip] {mac}: gated (quiet/pref/cooldown), duration={duration}s")
+            else:
+                # RSSI התאושש — נקה את ה-since
+                if weak_since:
+                    try:
+                        state_ref.child("weak_wifi_since").delete()
+                        print(f"  [weak-wifi-clear] {mac}: rssi={wifi_rssi} dBm recovered")
+                    except Exception as e:
+                        print(f"  [weak-wifi-clear-err] {mac}: {e}")
+
+    # 9. V14.0: Tiered alert email — מייל מדורג לפי alert_level מהקושחה
+    # v2026-06-20: גארד טריות — אם הבקר offline, ה-alert_level הוא זומבי. אל תשלח.
     if controller_stale:
         fw_alert_level = status.get("alert_level", 0)
         age = (now_ts() - int(last_update)) if last_update else -1
